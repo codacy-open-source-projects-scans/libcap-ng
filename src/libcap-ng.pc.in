@@ -1,0 +1,12 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: libcap-ng
+Description: An alternate POSIX capabilities library.
+Version: @VERSION@
+Libs: -L${libdir} -lcap-ng
+Cflags: -I${includedir}
+License: LGPL-2.1-or-later
+
