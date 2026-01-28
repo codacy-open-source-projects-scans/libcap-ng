@@ -30,7 +30,7 @@ define([AC_INIT_NOTICE],
 ])
 
 AC_REVISION($Revision: 1.3 $)dnl
-AC_INIT([libcap-ng],[0.9])
+AC_INIT([libcap-ng],[0.9.1])
 AC_PREREQ([2.50])dnl
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
@@ -69,12 +69,6 @@ AC_ARG_ENABLE([cap-audit],
 AS_HELP_STRING([--enable-cap-audit],[build cap-audit [[default=no]]]),
 [enable_cap_audit=$enableval],
 [enable_cap_audit=no])
-
-AC_ARG_ENABLE([deprecated],
-AS_HELP_STRING([--enable-deprecated],
-[enable deprecated utilities such as captest [[default=no]]]),
-[enable_deprecated=$enableval],
-[enable_deprecated=no])
 
 if test "x$enable_cap_audit" = "xyes"; then
 missing_cap_audit_deps=no
@@ -127,6 +121,18 @@ fi
 
 if test "x$BPF_ARCH" = "x"; then
 AC_MSG_ERROR([failed to determine BPF target arch; use --with-bpf-arch])
+fi
+
+AC_MSG_CHECKING(enable-deprecated)
+AC_ARG_ENABLE([deprecated],
+AS_HELP_STRING([--enable-deprecated],
+[enable deprecated utilities such as captest [[default=no]]]),
+[enable_deprecated=$enableval],
+[enable_deprecated=no])
+if test x$enable_deprecated = xno ; then
+	AC_MSG_RESULT(no)
+else
+	AC_MSG_RESULT(yes)
 fi
 
 AC_SUBST(BPF_ARCH)
