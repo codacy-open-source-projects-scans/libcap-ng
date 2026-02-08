@@ -85,8 +85,6 @@ struct cap_check {
 	unsigned long denied;
 	int needed;
 	char *reason;
-	char **syscall_contexts;
-	size_t num_contexts;
 };
 
 // Program global variables
@@ -125,6 +123,7 @@ struct audit_state {
 	int verbose;
 	int json_output;
 	int yaml_output;
+	int sync_pipe[2];
 	char **target_argv;
 	volatile sig_atomic_t stop;
 };
@@ -142,27 +141,21 @@ static int include_cap_in_recommendations(int cap)
 }
 
 /*
- * inspect_target_file_caps - read file capability xattr of target program.
+ * resolve_target_exe - read resolved executable path for target process.
  * @pid: pid of the traced process.
+ * @exepath: buffer for resolved path.
+ * @exepath_len: size of buffer.
  *
- * Uses /proc/<pid>/exe to query file capabilities with capng_get_caps_fd.
- * Sets flags describing whether file capabilities are present and whether
- * CAP_SETPCAP appears in that xattr. Returns 0 on success, -1 on error.
+ * Waits for /proc/<pid>/exe to update after exec by ignoring pointers to
+ * the auditor binary. Returns 0 on success, -1 on error.
  */
-static int inspect_target_file_caps(pid_t pid)
+static int resolve_target_exe(pid_t pid, char *exepath, size_t exepath_len)
 {
 	char linkpath[64];
-	char exepath[PATH_MAX];
 	char selfpath[PATH_MAX];
 	ssize_t len;
 	ssize_t self_len;
-	int fd;
 	int tries = 50;
-	struct stat st;
-	capng_results_t caps;
-
-	state.app.file_caps = 0;
-	state.app.file_setpcap = 0;
 
 	if (snprintf(linkpath, sizeof(linkpath), "/proc/%d/exe", pid) < 0)
 		return -1;
@@ -172,7 +165,7 @@ static int inspect_target_file_caps(pid_t pid)
 		selfpath[self_len] = '\0';
 
 	while (tries--) {
-		len = readlink(linkpath, exepath, sizeof(exepath) - 1);
+		len = readlink(linkpath, exepath, exepath_len - 1);
 		if (len < 0) {
 			fprintf(stderr, "Warning: readlink(%s) failed: %s\n",
 				linkpath, strerror(errno));
@@ -189,6 +182,30 @@ static int inspect_target_file_caps(pid_t pid)
 				linkpath, exepath);
 		usleep(10000);
 	}
+
+	return 0;
+}
+
+/*
+ * inspect_target_file_caps - read file capability xattr of target program.
+ * @pid: pid of the traced process.
+ *
+ * Uses /proc/<pid>/exe to query file capabilities with capng_get_caps_fd.
+ * Sets flags describing whether file capabilities are present and whether
+ * CAP_SETPCAP appears in that xattr. Returns 0 on success, -1 on error.
+ */
+static int inspect_target_file_caps(pid_t pid)
+{
+	char exepath[PATH_MAX];
+	int fd;
+	struct stat st;
+	capng_results_t caps;
+
+	state.app.file_caps = 0;
+	state.app.file_setpcap = 0;
+
+	if (resolve_target_exe(pid, exepath, sizeof(exepath)) < 0)
+		return -1;
 
 	fd = open(exepath, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
@@ -256,6 +273,12 @@ static void print_cap_name_upper(int cap)
 		printf("%c", toupper((unsigned char)name[i]));
 }
 
+static const char *cap_name_safe(int cap)
+{
+	const char *name = capng_capability_to_name(cap);
+	return name ? name : "unknown";
+}
+
 /*
  * sig_handler - handle termination signals.
  * @sig: signal number (unused).
@@ -298,7 +321,7 @@ static int set_memlock_rlimit(void)
  * Clears cached capability information and refreshes it from the current
  * process. Returns 0 on success, -1 on failure.
  */
-int init_capng(void)
+static int init_capng(void)
 {
 	capng_clear(CAPNG_SELECT_BOTH);
 
@@ -317,7 +340,7 @@ int init_capng(void)
  * for loading and running the eBPF program. Warns if CAP_SYS_PTRACE is
  * absent. Returns 0 if requirements are satisfied, -1 otherwise.
  */
-int check_auditor_caps(void)
+static int check_auditor_caps(void)
 {
 	if (!capng_have_capability(CAPNG_EFFECTIVE, CAP_BPF) &&
 	    !capng_have_capability(CAPNG_EFFECTIVE, CAP_SYS_ADMIN)) {
@@ -349,7 +372,7 @@ int check_auditor_caps(void)
  * of 1, and optionally logs the registration when verbose. Returns 0 on
  * success or -1 on error.
  */
-int set_target_pid(pid_t pid)
+static int set_target_pid(pid_t pid)
 {
 	int map_fd;
 	__u8 val = 1;
@@ -373,12 +396,11 @@ int set_target_pid(pid_t pid)
 }
 
 /*
- * read_system_state - snapshot kernel tunables relevant to capabilities.
- * @app: application tracking structure to populate.
+ * read_sysctl - a helper function to read a given sysctl value
+ * @path: the path to the sysctl to read
+ * @value: a pointer where the value is stored
  *
- * Reads a handful of /proc/sys values that influence capability behavior
- * (ptrace scope, perf_event paranoid, BPF toggles, kernel version). Missing
- * files are recorded as -1 to indicate unknown. No return value.
+ * No return value
  */
 static void read_sysctl(const char *path, int *value)
 {
@@ -394,7 +416,15 @@ static void read_sysctl(const char *path, int *value)
 	}
 }
 
-void read_system_state(struct app_caps *app)
+/*
+ * read_system_state - snapshot kernel tunables relevant to capabilities.
+ * @app: application tracking structure to populate.
+ *
+ * Reads a handful of /proc/sys values that influence capability behavior
+ * (ptrace scope, perf_event paranoid, BPF toggles, kernel version). Missing
+ * files are recorded as -1 to indicate unknown. No return value.
+ */
+static void read_system_state(struct app_caps *app)
 {
 	FILE *f;
 
@@ -457,6 +487,9 @@ static void update_reason(struct cap_check *check, int syscall_nr)
 {
 	const char *syscall_name;
 
+	if (check->reason)
+		free(check->reason);
+
 	if (syscall_nr < 0) {
 		if (asprintf(&check->reason,
 			     "Used during capability check (syscall unknown)") < 0)
@@ -465,12 +498,99 @@ static void update_reason(struct cap_check *check, int syscall_nr)
 	}
 
 	syscall_name = syscall_name_from_nr(syscall_nr);
-	if (check->reason)
-		free(check->reason);
-
 	if (asprintf(&check->reason, "Used by %s (syscall %d)",
 		     syscall_name ? syscall_name : "unknown", syscall_nr) < 0)
 		check->reason = NULL;
+}
+
+/*
+ * json_escape - escape a string for JSON output.
+ * @input: string to escape.
+ *
+ * Returns a newly allocated escaped string or NULL on allocation failure.
+ */
+static char *json_escape(const char *input)
+{
+	size_t i;
+	size_t needed = 0;
+	char *out;
+	char *pos;
+
+	if (!input)
+		return strdup("");
+
+	for (i = 0; input[i]; i++) {
+		unsigned char c = input[i];
+
+		switch (c) {
+		case '\"':
+		case '\\':
+		case '\b':
+		case '\f':
+		case '\n':
+		case '\r':
+		case '\t':
+			needed += 2;
+			break;
+		default:
+			if (c < 0x20)
+				needed += 6;
+			else
+				needed++;
+			break;
+		}
+	}
+
+	out = malloc(needed + 1);
+	if (!out)
+		return NULL;
+
+	pos = out;
+	for (i = 0; input[i]; i++) {
+		unsigned char c = input[i];
+
+		switch (c) {
+		case '\"':
+			*pos++ = '\\';
+			*pos++ = '\"';
+			break;
+		case '\\':
+			*pos++ = '\\';
+			*pos++ = '\\';
+			break;
+		case '\b':
+			*pos++ = '\\';
+			*pos++ = 'b';
+			break;
+		case '\f':
+			*pos++ = '\\';
+			*pos++ = 'f';
+			break;
+		case '\n':
+			*pos++ = '\\';
+			*pos++ = 'n';
+			break;
+		case '\r':
+			*pos++ = '\\';
+			*pos++ = 'r';
+			break;
+		case '\t':
+			*pos++ = '\\';
+			*pos++ = 't';
+			break;
+		default:
+			if (c < 0x20) {
+				snprintf(pos, 7, "\\u%04x", c);
+				pos += 6;
+			} else {
+				*pos++ = c;
+			}
+			break;
+		}
+	}
+	*pos = '\0';
+
+	return out;
 }
 
 /*
@@ -483,7 +603,7 @@ static void update_reason(struct cap_check *check, int syscall_nr)
  * marks capabilities as definitely needed when the kernel granted them.
  * Returns 0 to keep polling.
  */
-int handle_cap_event(void *ctx __attribute__((unused)), void *data,
+static int handle_cap_event(void *ctx __attribute__((unused)), void *data,
 		     size_t data_sz __attribute__((unused)))
 {
 	const struct cap_event *e = data;
@@ -513,7 +633,7 @@ int handle_cap_event(void *ctx __attribute__((unused)), void *data,
 		printf("[CAP] pid=%d cap=%d (%s) result=%s syscall=%d (%s) "
 		       "comm=%s\n",
 		       e->pid, e->capability,
-		       capng_capability_to_name(e->capability),
+		       cap_name_safe(e->capability),
 		       e->result ? "GRANTED" : "DENIED", e->syscall_nr,
 		       syscall_name_from_nr(e->syscall_nr) ?: "unknown",
 		       e->comm);
@@ -549,7 +669,7 @@ int handle_cap_event(void *ctx __attribute__((unused)), void *data,
  * highlight required, conditional, and denied capabilities. Also emits
  * configuration snippets for common deployment targets. No return value.
  */
-void analyze_capabilities(void)
+static void analyze_capabilities(void)
 {
 	int has_required = 0;
 	int has_conditional = 0;
@@ -601,7 +721,7 @@ void analyze_capabilities(void)
 		if (check->granted > 0) {
 			has_required = 1;
 			// Summarize how many times the kernel permitted usage.
-			printf("  %s (#%d)\n", capng_capability_to_name(i), i);
+			printf("  %s (#%d)\n", cap_name_safe(i), i);
 			printf("    Checks: %lu granted, %lu denied\n",
 			       check->granted, check->denied);
 			if (check->reason)
@@ -801,7 +921,7 @@ void analyze_capabilities(void)
 		check = &state.app.checks[i];
 		if (check->denied > 0 && check->granted == 0) {
 			has_denied = 1;
-			printf("  %s (#%d)\n", capng_capability_to_name(i), i);
+			printf("  %s (#%d)\n", cap_name_safe(i), i);
 			printf("    Attempts: %lu (all denied)\n",
 			       check->denied);
 			printf("    Impact: Application may have reduced "
@@ -893,7 +1013,7 @@ void analyze_capabilities(void)
 			    include_cap_in_recommendations(i)) {
 				if (!first)
 					printf(" ");
-				printf("%s", capng_capability_to_name(i));
+				printf("%s", cap_name_safe(i));
 				first = 0;
 			}
 		}
@@ -905,7 +1025,7 @@ void analyze_capabilities(void)
 			    include_cap_in_recommendations(i)) {
 				if (!first)
 					printf(" ");
-				printf("%s", capng_capability_to_name(i));
+				printf("%s", cap_name_safe(i));
 				first = 0;
 			}
 		}
@@ -916,7 +1036,7 @@ void analyze_capabilities(void)
 		for (i = 0; i <= CAP_LAST_CAP; i++) {
 			if (state.app.checks[i].granted > 0 &&
 			    include_cap_in_recommendations(i))
-				printf(" %s", capng_capability_to_name(i));
+				printf(" %s", cap_name_safe(i));
 		}
 		printf("\n\n");
 
@@ -927,7 +1047,7 @@ void analyze_capabilities(void)
 			if (state.app.checks[i].granted > 0 &&
 			    include_cap_in_recommendations(i))
 				printf("      --cap-add=%s \\\n",
-				       capng_capability_to_name(i));
+				       cap_name_safe(i));
 		}
 		printf("      your-image:tag\n\n");
 
@@ -942,8 +1062,7 @@ void analyze_capabilities(void)
 		for (i = 0; i <= CAP_LAST_CAP; i++) {
 			if (state.app.checks[i].granted > 0 &&
 			    include_cap_in_recommendations(i))
-				printf("          - %s\n",
-				       capng_capability_to_name(i));
+				printf("          - %s\n", cap_name_safe(i));
 		}
 		printf("\n");
 	} else {
@@ -963,21 +1082,26 @@ void analyze_capabilities(void)
  * Serializes application info, system context, required capabilities, and
  * denied-only attempts to stdout. No return value.
  */
-void output_json(void)
+static void output_json(void)
 {
 	int i;
 	int first_cap;
 	int first_denied;
+	char *exe_json;
+	char *kernel_json;
+
+	exe_json = json_escape(state.app.exe);
+	kernel_json = json_escape(state.app.kernel_version);
 
 	printf("{\n");
 	printf("  \"application\": {\n");
 	printf("    \"pid\": %d,\n", state.app.pid);
-	printf("    \"comm\": \"%s\"\n", state.app.exe);
+	printf("    \"comm\": \"%s\"\n", exe_json ? exe_json : "");
 	printf("  },\n");
 
 	printf("  \"system_context\": {\n");
 	printf("    \"kernel_version\": \"%s\",\n",
-	       state.app.kernel_version);
+	       kernel_json ? kernel_json : "");
 	printf("    \"yama_ptrace_scope\": %d,\n", state.app.yama_ptrace_scope);
 	printf("    \"kptr_restrict\": %d,\n", state.app.kptr_restrict);
 	printf("    \"dmesg_restrict\": %d,\n", state.app.dmesg_restrict);
@@ -998,18 +1122,26 @@ void output_json(void)
 	printf("    \"fs_suid_dumpable\": %d\n", state.app.suid_dumpable);
 	printf("  },\n");
 
+	free(exe_json);
+	free(kernel_json);
+
 	printf("  \"required_capabilities\": [\n");
 	first_cap = 1;
 	for (i = 0; i <= CAP_LAST_CAP; i++) {
 		struct cap_check *check = &state.app.checks[i];
+		char *name_json;
+		char *reason_json;
 
 		if (check->granted > 0) {
+			name_json = json_escape(capng_capability_to_name(i));
+			reason_json = check->reason ?
+				json_escape(check->reason) : NULL;
 			if (!first_cap)
 				printf(",\n");
 			printf("    {\n");
 			printf("      \"number\": %d,\n", i);
 			printf("      \"name\": \"%s\",\n",
-			       capng_capability_to_name(i));
+			       name_json ? name_json : "");
 			printf("      \"checks\": {\n");
 			printf("        \"total\": %lu,\n", check->count);
 			printf("        \"granted\": %lu,\n", check->granted);
@@ -1017,11 +1149,13 @@ void output_json(void)
 			printf("      }");
 			if (check->reason)
 				printf(",\n      \"reason\": \"%s\"\n",
-				       check->reason);
+				       reason_json ? reason_json : "");
 			else
 				printf("\n");
 			printf("    }");
 			first_cap = 0;
+			free(name_json);
+			free(reason_json);
 		}
 	}
 	printf("\n  ],\n");
@@ -1030,17 +1164,20 @@ void output_json(void)
 	first_denied = 1;
 	for (i = 0; i <= CAP_LAST_CAP; i++) {
 		struct cap_check *check = &state.app.checks[i];
+		char *name_json;
 
 		if (check->denied > 0 && check->granted == 0) {
+			name_json = json_escape(capng_capability_to_name(i));
 			if (!first_denied)
 				printf(",\n");
 			printf("    {\n");
 			printf("      \"number\": %d,\n", i);
 			printf("      \"name\": \"%s\",\n",
-			       capng_capability_to_name(i));
+			       name_json ? name_json : "");
 			printf("      \"attempts\": %lu\n", check->denied);
 			printf("    }");
 			first_denied = 0;
+			free(name_json);
 		}
 	}
 	printf("\n  ]\n");
@@ -1053,7 +1190,7 @@ void output_json(void)
  * Provides a YAML representation mirroring the JSON layout so consumers can
  * parse the auditor output more easily. No return value.
  */
-void output_yaml(void) {
+static void output_yaml(void) {
 	int i;
 
 	printf("application:\n");
@@ -1104,8 +1241,7 @@ void output_yaml(void) {
 
 		if (check->denied > 0 && check->granted == 0) {
 			printf("  - number: %d\n", i);
-			printf("    name: %s\n",
-			       capng_capability_to_name(i));
+			printf("    name: %s\n", cap_name_safe(i));
 			printf("    attempts: %lu\n", check->denied);
 		}
 	}
@@ -1118,19 +1254,20 @@ void output_yaml(void) {
  * Reads the first line of the file to spot a shebang with "python" or the
  * ELF magic. Returns PYTHON, ELF, or UNSUPPORTED accordingly.
  */
-type_t classify_app(const char *exe)
+static type_t classify_app(const char *exe)
 {
 	int fd;
+	ssize_t rc;
 	char buf[257];
 
-	fd = open(exe, O_RDONLY|O_NONBLOCK);
+	fd = open(exe, O_RDONLY);
 	if (fd < 0) {
 		fprintf(stderr, "Cannot open %s - %s\n", exe, strerror(errno));
 		exit(1);
 	}
 
 	// classify the app
-	ssize_t rc = read(fd, buf, 256);
+	rc = read(fd, buf, 256);
 	close(fd);
 	if (rc > 0) {
 		// terminate buffer
@@ -1216,7 +1353,7 @@ int main(int argc, char **argv)
 		return 1;
 
 	state.app.exe = strdup(state.target_argv[0]);
-	state.app.prog_type = classify_app(state.app.exe);
+	state.app.prog_type = UNSUPPORTED;
 	if (audit_machine < 0)
 		audit_machine = audit_detect_machine();
 	if (audit_machine < 0) {
@@ -1254,15 +1391,37 @@ int main(int argc, char **argv)
 
 	printf("[*] Capability auditor started\n");
 
+	if (pipe(state.sync_pipe) != 0) {
+		fprintf(stderr, "Error: pipe failed: %s\n", strerror(errno));
+		ring_buffer__free(state.rb);
+		cap_audit_bpf__destroy(state.skel);
+		return 1;
+	}
+
 	child = fork();
 	if (child == 0) {
-		// Child pauses briefly so parent can insert PID into BPF map.
-		usleep(100000);
+		char sync_byte;
+		ssize_t bytes;
+
+		close(state.sync_pipe[1]);
+		bytes = read(state.sync_pipe[0], &sync_byte, 1);
+		if (bytes != 1) {
+			if (bytes < 0)
+				perror("read");
+			else
+				fprintf(stderr,
+					"Error: failed to sync with parent\n");
+			close(state.sync_pipe[0]);
+			exit(1);
+		}
+		close(state.sync_pipe[0]);
 		execvp(state.target_argv[0], state.target_argv);
 		perror("execvp");
 		exit(1);
 	} else if (child < 0) {
 		fprintf(stderr, "Error: fork failed: %s\n", strerror(errno));
+		close(state.sync_pipe[0]);
+		close(state.sync_pipe[1]);
 		ring_buffer__free(state.rb);
 		cap_audit_bpf__destroy(state.skel);
 		return 1;
@@ -1270,13 +1429,44 @@ int main(int argc, char **argv)
 
 	state.app.pid = child;
 
+	close(state.sync_pipe[0]);
 	if (set_target_pid(child) != 0) {
+		close(state.sync_pipe[1]);
 		kill(child, SIGKILL);
 		waitpid(child, NULL, 0);
 		ring_buffer__free(state.rb);
 		cap_audit_bpf__destroy(state.skel);
 		free(state.app.exe);
 		return 1;
+	}
+
+	if (write(state.sync_pipe[1], "1", 1) != 1) {
+		fprintf(stderr, "Error: write failed: %s\n", strerror(errno));
+		close(state.sync_pipe[1]);
+		kill(child, SIGKILL);
+		waitpid(child, NULL, 0);
+		ring_buffer__free(state.rb);
+		cap_audit_bpf__destroy(state.skel);
+		free(state.app.exe);
+		return 1;
+	}
+	close(state.sync_pipe[1]);
+
+	{
+		char resolved[PATH_MAX];
+
+		if (resolve_target_exe(child, resolved, sizeof(resolved)) == 0) {
+			char *resolved_dup = strdup(resolved);
+
+			if (resolved_dup) {
+				free(state.app.exe);
+				state.app.exe = resolved_dup;
+			}
+			state.app.prog_type = classify_app(state.app.exe);
+		} else {
+			fprintf(stderr,
+				"Warning: unable to resolve target path\n");
+		}
 	}
 
 	read_system_state(&state.app);
