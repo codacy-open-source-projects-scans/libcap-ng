@@ -67,6 +67,16 @@
  * addresses so the rendered tree/JSON can be consumed as an exposure map.
  * VSOCK listeners are collected via sock_diag when available and fall back to
  * /proc parsing when not, with ownership stitched back through socket inodes.
+ * Tree output supports colorized capability/flag severity, with --no-color
+ * forcing plain text. SO_REUSEPORT is detected per socket via pidfd_open and
+ * pidfd_getfd while scanning /proc/<pid>/fd so the flag can be propagated into
+ * endpoint rendering.
+ *
+ * Process metadata includes ambient capability enumeration with per-capability
+ * detail and cgroup-unit extraction limited to system.slice services to keep
+ * ownership context focused on service units. Line wrapping for tree output is
+ * ANSI-escape-aware so colorized text wraps at display width without breaking
+ * SGR sequences.
  *
  * Results depend on the current network namespace and procfs visibility;
  * restricted privileges can hide processes/sockets and yield partial output.
@@ -193,7 +203,139 @@ struct pidset {
 	size_t used;
 };
 
+struct status_fields {
+	unsigned long no_new_privs;
+	unsigned long seccomp;
+	unsigned long secbits;
+	int seen_no_new_privs;
+	int seen_seccomp;
+	int seen_secbits;
+};
+
+struct endpoint_attrs {
+	int wildcard;
+	int reuseport;
+};
+
 static void free_process(struct process_info *p);
+
+static int use_color;
+
+#define COLOR_ORANGE	"\033[38;5;208m"
+#define COLOR_YELLOW	"\033[38;5;226m"
+#define COLOR_GREEN	"\033[38;5;82m"
+#define COLOR_RESET	"\033[0m"
+
+enum cap_severity {
+	CAP_SEV_NEUTRAL,
+	CAP_SEV_YELLOW,
+	CAP_SEV_ORANGE,
+};
+
+static const char *orange_caps[] = {
+	"sys_ptrace", "sys_module", "sys_rawio", "setuid", "setgid",
+	"setpcap", "audit_control",
+};
+
+static const char *yellow_caps[] = {
+	"sys_admin", "dac_override", "dac_read_search", "net_admin",
+	"net_raw", "chown", "fowner", "mknod", "sys_chroot",
+};
+
+/*
+ * cap_name_severity - classify one capability name into severity tiers.
+ * @name: capability token without "cap_" prefix.
+ *
+ * Returns severity bucket used for tree color selection.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
+static enum cap_severity cap_name_severity(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(orange_caps) / sizeof(orange_caps[0]); i++) {
+		if (strcmp(name, orange_caps[i]) == 0)
+			return CAP_SEV_ORANGE;
+	}
+	for (i = 0; i < sizeof(yellow_caps) / sizeof(yellow_caps[0]); i++) {
+		if (strcmp(name, yellow_caps[i]) == 0)
+			return CAP_SEV_YELLOW;
+	}
+	return CAP_SEV_NEUTRAL;
+}
+
+/*
+ * caps_contains_token - test whether @token appears as a capability list item.
+ * @caps: comma/space separated capability summary text.
+ * @token: capability token to locate.
+ *
+ * Returns non-zero when @token is present as a whole list element, else 0.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
+static int caps_contains_token(const char *caps, const char *token)
+{
+	size_t len;
+	const char *p;
+
+	if (!caps || !token)
+		return 0;
+	len = strlen(token);
+	for (p = caps; (p = strstr(p, token)) != NULL; p++) {
+		int left_ok = (p == caps) ||
+			(p > caps + 1 && p[-1] == ' ' && p[-2] == ',');
+		char right = p[len];
+		int right_ok = right == 0 || right == ',' || right == ' ' || right == '[';
+
+		if (left_ok && right_ok)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * sev_color - map severity level to ANSI color sequence.
+ * @sev: severity class to map.
+ *
+ * Returns static color code pointer, or NULL when uncolored.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
+static const char *sev_color(enum cap_severity sev)
+{
+	if (sev == CAP_SEV_ORANGE)
+		return COLOR_ORANGE;
+	if (sev == CAP_SEV_YELLOW)
+		return COLOR_YELLOW;
+	return NULL;
+}
+
+/*
+ * caps_worst_severity - find highest severity capability in @caps text.
+ * @caps: capability list text from caps_summary_for_pid().
+ *
+ * Returns highest matched severity, or CAP_SEV_NEUTRAL.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
+static enum cap_severity caps_worst_severity(const char *caps)
+{
+	size_t i;
+
+	if (!caps)
+		return CAP_SEV_NEUTRAL;
+	for (i = 0; i < sizeof(orange_caps) / sizeof(orange_caps[0]); i++) {
+		if (caps_contains_token(caps, orange_caps[i]))
+			return CAP_SEV_ORANGE;
+	}
+	for (i = 0; i < sizeof(yellow_caps) / sizeof(yellow_caps[0]); i++) {
+		if (caps_contains_token(caps, yellow_caps[i]))
+			return CAP_SEV_YELLOW;
+	}
+	return CAP_SEV_NEUTRAL;
+}
+
 static void free_model(struct model *m);
 static void json_escape(const char *s);
 static void print_tree_node(const char *prefix, int is_last,
@@ -201,6 +343,15 @@ static void print_tree_node(const char *prefix, int is_last,
 static int bind_sort_cmp(const char *a, const char *b);
 static struct inode_proc *lookup_inode(struct model *m, unsigned long inode);
 
+/*
+ * str_hash - hash a string key for open-addressed set placement.
+ * @s: NUL-terminated key string.
+ * @slots_cap: destination hash table capacity.
+ *
+ * Returns index in [0, @slots_cap).
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static size_t str_hash(const char *s, size_t slots_cap)
 {
 	uint64_t x = 1469598103934665603ULL;
@@ -212,6 +363,15 @@ static size_t str_hash(const char *s, size_t slots_cap)
 	return (size_t)(x % slots_cap);
 }
 
+/*
+ * strset_rebuild - resize and rehash string set storage.
+ * @set: set object whose slots array is replaced.
+ * @new_cap: requested slot capacity before minimum clamping.
+ *
+ * Returns 0 on success, -1 on allocation failure.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static int strset_rebuild(struct strset *set, size_t new_cap)
 {
 	const char **slots;
@@ -240,6 +400,15 @@ static int strset_rebuild(struct strset *set, size_t new_cap)
 	return 0;
 }
 
+/*
+ * strset_add - insert @s into the string set if absent.
+ * @set: destination hash set.
+ * @s: caller-owned string pointer stored by reference.
+ *
+ * Returns 1 when inserted, 0 when already present, -1 on failure.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static int strset_add(struct strset *set, const char *s)
 {
 	size_t pos;
@@ -268,6 +437,13 @@ static int strset_add(struct strset *set, const char *s)
 	return 1;
 }
 
+/*
+ * strset_free - release dynamic storage owned by @set.
+ * @set: hash set to reset.
+ *
+ * Returns no value.
+ * Side effects/assumptions: Frees heap memory referenced by @set.
+ */
 static void strset_free(struct strset *set)
 {
 	free(set->slots);
@@ -276,6 +452,15 @@ static void strset_free(struct strset *set)
 	set->used = 0;
 }
 
+/*
+ * inode_hash - hash inode key for inode ownership map slot selection.
+ * @inode: socket inode value.
+ * @slots_cap: destination hash table capacity.
+ *
+ * Returns index in [0, @slots_cap).
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static size_t inode_hash(unsigned long inode, size_t slots_cap)
 {
 	uint64_t x = inode;
@@ -288,6 +473,15 @@ static size_t inode_hash(unsigned long inode, size_t slots_cap)
 	return (size_t)(x % slots_cap);
 }
 
+/*
+ * inode_hash_rebuild - resize and repopulate inode hash slots.
+ * @m: model containing inode_map entries and slot metadata.
+ * @new_cap: requested new slot capacity.
+ *
+ * Returns 0 on success, -1 on allocation failure.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static int inode_hash_rebuild(struct model *m, size_t new_cap)
 {
 	size_t i;
@@ -317,6 +511,14 @@ static int inode_hash_rebuild(struct model *m, size_t new_cap)
 	return 0;
 }
 
+/*
+ * inode_hash_ensure_capacity - grow inode hash table when load is high.
+ * @m: model whose inode slot table may be resized.
+ *
+ * Returns 0 when capacity is sufficient or grown, -1 on failure.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static int inode_hash_ensure_capacity(struct model *m)
 {
 	size_t new_cap;
@@ -332,6 +534,15 @@ static int inode_hash_ensure_capacity(struct model *m)
 	return inode_hash_rebuild(m, new_cap);
 }
 
+/*
+ * inode_hash_find - find inode_map index for @inode.
+ * @m: model containing inode hash slots.
+ * @inode: inode key to search.
+ *
+ * Returns non-negative inode_map index on hit, -1 on miss.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static ssize_t inode_hash_find(struct model *m, unsigned long inode)
 {
 	size_t pos;
@@ -354,6 +565,14 @@ static ssize_t inode_hash_find(struct model *m, unsigned long inode)
 	return -1;
 }
 
+/*
+ * inode_hash_insert - place one inode_map index into hash slots.
+ * @m: model containing destination hash slots.
+ * @idx: inode_map entry index to insert.
+ *
+ * Returns no value.
+ * Side effects/assumptions: Mutates @m->inode_slots insertion state.
+ */
 static void inode_hash_insert(struct model *m, size_t idx)
 {
 	size_t pos = inode_hash(m->inode_map[idx].inode, m->inode_slots_cap);
@@ -438,6 +657,15 @@ static int vec_grow(void **v, size_t *cap, size_t item)
 	return 0;
 }
 
+/*
+ * pid_hash - hash process ID for pidset probing.
+ * @pid: process id key.
+ * @cap: pidset slot capacity.
+ *
+ * Returns slot index in [0, @cap).
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static size_t pid_hash(int pid, size_t cap)
 {
 	uint32_t v = (uint32_t)pid;
@@ -450,6 +678,15 @@ static size_t pid_hash(int pid, size_t cap)
 	return v % cap;
 }
 
+/*
+ * pidset_rehash - resize/reinsert pidset contents.
+ * @ps: pidset to grow.
+ * @new_cap: requested slot capacity.
+ *
+ * Returns 0 on success, -1 on allocation failure.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static int pidset_rehash(struct pidset *ps, size_t new_cap)
 {
 	int *new_slots;
@@ -476,6 +713,13 @@ static int pidset_rehash(struct pidset *ps, size_t new_cap)
 	return 0;
 }
 
+/*
+ * pidset_init - initialize pidset with empty hash table state.
+ * @ps: pidset object to initialize.
+ *
+ * Returns 0 on success, -1 on allocation failure.
+ * Side effects/assumptions: Allocates heap storage for @ps slots.
+ */
 static int pidset_init(struct pidset *ps)
 {
 	ps->cap = 16;
@@ -488,6 +732,13 @@ static int pidset_init(struct pidset *ps)
 	return 0;
 }
 
+/*
+ * pidset_free - release pidset storage and reset fields.
+ * @ps: pidset object to clear.
+ *
+ * Returns no value.
+ * Side effects/assumptions: Frees heap memory referenced by @ps.
+ */
 static void pidset_free(struct pidset *ps)
 {
 	free(ps->slots);
@@ -496,6 +747,15 @@ static void pidset_free(struct pidset *ps)
 	ps->used = 0;
 }
 
+/*
+ * pidset_test_and_add - query/insert PID in dedup set.
+ * @ps: pidset tracking seen process IDs.
+ * @pid: process id to test and insert.
+ *
+ * Returns 1 if already present, 0 if newly inserted, -1 on failure.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static int pidset_test_and_add(struct pidset *ps, int pid)
 {
 	size_t pos;
@@ -515,23 +775,35 @@ static int pidset_test_and_add(struct pidset *ps, int pid)
 	return 0;
 }
 
+/*
+ * print_flag_nodes - render endpoint/process flag leaves under "flags" node.
+ * @pfx_flags: tree prefix for flag child lines.
+ * @width: wrap width for tree nodes.
+ * @flags: bitmask of endpoint/process flags to print.
+ * @priv_sev: privileged capability severity for colorizing that flag.
+ *
+ * Returns no value.
+ * Side effects/assumptions: Writes formatted output to stdout.
+ */
 static void print_flag_nodes(const char *pfx_flags, int width,
-	unsigned int flags)
+	unsigned int flags, enum cap_severity priv_sev)
 {
 	static const struct {
 		unsigned int bit;
 		const char *name;
+		const char *color;
 	} map[] = {
-		{ FLAG_HYPERVISOR_PLANE, "hypervisor-plane" },
-		{ FLAG_SSH_VSOCK_22, "ssh-on-vsock-port-22" },
-		{ FLAG_WILDCARD_BIND, "wildcard-bind" },
-		{ FLAG_REUSEPORT, "reuseport" },
-		{ FLAG_PRIVILEGED_CAPS, "privileged-caps" },
-		{ FLAG_SECUREBITS_LOCKED, "securebits-locked" },
+		{ FLAG_HYPERVISOR_PLANE, "hypervisor-plane", COLOR_YELLOW },
+		{ FLAG_SSH_VSOCK_22, "ssh-on-vsock-port-22", NULL },
+		{ FLAG_WILDCARD_BIND, "wildcard-bind", COLOR_YELLOW },
+		{ FLAG_REUSEPORT, "reuseport", COLOR_YELLOW },
+		{ FLAG_PRIVILEGED_CAPS, "privileged-caps", NULL },
+		{ FLAG_SECUREBITS_LOCKED, "securebits-locked", NULL },
 	};
 	size_t i;
 	size_t n = 0;
 	size_t printed = 0;
+	char node[256];
 
 	for (i = 0; i < sizeof(map) / sizeof(map[0]); i++)
 		if (flags & map[i].bit)
@@ -541,10 +813,21 @@ static void print_flag_nodes(const char *pfx_flags, int width,
 		return;
 	}
 	for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+		const char *color = map[i].color;
+
 		if (!(flags & map[i].bit))
 			continue;
+		if (map[i].bit == FLAG_PRIVILEGED_CAPS)
+			color = sev_color(priv_sev);
+		if (map[i].bit == FLAG_SECUREBITS_LOCKED)
+			color = COLOR_YELLOW;
+		if (use_color && color)
+			snprintf(node, sizeof(node), "%s%s%s", color, map[i].name,
+				COLOR_RESET);
+		else
+			snprintf(node, sizeof(node), "%s", map[i].name);
 		printed++;
-		print_tree_node(pfx_flags, printed == n, map[i].name, width);
+		print_tree_node(pfx_flags, printed == n, node, width);
 	}
 }
 
@@ -933,6 +1216,7 @@ static char *caps_summary_for_pid(int pid, int *privileged, int *has_amb,
  * @d: destination struct receiving caller-freed string fields.
  * @securebits_nondefault: out flag indicating meaningful securebits data.
  * @secbits_raw: out raw securebits value when present.
+ * @sf: parsed /proc/<pid>/status fields consumed for hardening decode.
  *
  * Missing fields are tolerated; function leaves best-effort defaults.
  * Returns no value.
@@ -941,9 +1225,7 @@ static char *caps_summary_for_pid(int pid, int *privileged, int *has_amb,
  */
 static void parse_status_defenses(int pid, int uid, struct defense_info *d,
 	int *securebits_nondefault, unsigned long *secbits_raw,
-	int seen_no_new_privs, unsigned long no_new_privs,
-	int seen_seccomp, unsigned long seccomp,
-	int seen_secbits, unsigned long secbits)
+	const struct status_fields *sf)
 {
 	char path[64];
 
@@ -956,15 +1238,15 @@ static void parse_status_defenses(int pid, int uid, struct defense_info *d,
 	*securebits_nondefault = 0;
 	*secbits_raw = 0;
 
-	if (seen_no_new_privs) {
+	if (sf->seen_no_new_privs) {
 		free(d->no_new_privs);
-		d->no_new_privs = xstrdup(no_new_privs ? "yes" : "no");
+		d->no_new_privs = xstrdup(sf->no_new_privs ? "yes" : "no");
 	}
-	if (seen_seccomp) {
+	if (sf->seen_seccomp) {
 		free(d->seccomp);
-		if (seccomp == 0)
+		if (sf->seccomp == 0)
 			d->seccomp = xstrdup("disabled");
-		else if (seccomp == 1)
+		else if (sf->seccomp == 1)
 			d->seccomp = xstrdup("strict");
 		else
 			d->seccomp = xstrdup("filter");
@@ -973,18 +1255,18 @@ static void parse_status_defenses(int pid, int uid, struct defense_info *d,
 	snprintf(path, sizeof(path), "/proc/%d/attr/current", pid);
 	d->lsm_label = read_first_line(path);
 
-	if (seen_secbits)
-		*secbits_raw = secbits;
-	if (uid == 0 || (seen_secbits && secbits != 0)) {
+	if (sf->seen_secbits)
+		*secbits_raw = sf->secbits;
+	if (uid == 0 || (sf->seen_secbits && sf->secbits != 0)) {
 		char buf[256];
 		/*
 		 * Keep this decode local and explicit so reviewers can audit each
 		 * bit's textual interpretation without cross-referencing helpers.
 		 */
-		int keep = !!(secbits & 0x10);
-		int nofix = !!(secbits & 0x04);
-		int noroot = !!(secbits & 0x01);
-		int locked = !!(secbits & (0x20 | 0x08 | 0x02));
+		int keep = !!(sf->secbits & 0x10);
+		int nofix = !!(sf->secbits & 0x04);
+		int noroot = !!(sf->secbits & 0x01);
+		int locked = !!(sf->secbits & (0x20 | 0x08 | 0x02));
 		snprintf(buf, sizeof(buf),
 			"keep_caps=%s no_setuid_fixup=%s noroot=%s",
 			keep ? "yes" : "no",
@@ -1016,12 +1298,7 @@ static struct process_info *add_process(struct model *m, int pid)
 	char *amb_list = NULL;
 	int secure_nondefault = 0;
 	unsigned long secbits_raw = 0;
-	unsigned long no_new_privs = 0;
-	unsigned long seccomp = 0;
-	unsigned long secbits = 0;
-	int seen_no_new_privs = 0;
-	int seen_seccomp = 0;
-	int seen_secbits = 0;
+	struct status_fields sf = { 0 };
 	struct process_info *p;
 
 	snprintf(path, sizeof(path), "/proc/%d/status", pid);
@@ -1034,20 +1311,20 @@ static struct process_info *add_process(struct model *m, int pid)
 			continue;
 		if (sscanf(line, "Uid:\t%d", &uid) == 1)
 			continue;
-		if (sscanf(line, "NoNewPrivs:\t%lu", &no_new_privs) == 1) {
-			seen_no_new_privs = 1;
+		if (sscanf(line, "NoNewPrivs:\t%lu", &sf.no_new_privs) == 1) {
+			sf.seen_no_new_privs = 1;
 			continue;
 		}
-		if (sscanf(line, "Seccomp:\t%lu", &seccomp) == 1) {
-			seen_seccomp = 1;
+		if (sscanf(line, "Seccomp:\t%lu", &sf.seccomp) == 1) {
+			sf.seen_seccomp = 1;
 			continue;
 		}
-		if (sscanf(line, "Secbits:\t%lx", &secbits) == 1) {
-			seen_secbits = 1;
+		if (sscanf(line, "Secbits:\t%lx", &sf.secbits) == 1) {
+			sf.seen_secbits = 1;
 			continue;
 		}
-		if (uid >= 0 && comm[0] && seen_no_new_privs && seen_seccomp &&
-		    seen_secbits)
+		if (uid >= 0 && comm[0] && sf.seen_no_new_privs &&
+		    sf.seen_seccomp && sf.seen_secbits)
 			break;
 	}
 	fclose(f);
@@ -1081,8 +1358,7 @@ static struct process_info *add_process(struct model *m, int pid)
 	p->ambient_present = has_amb;
 	p->open_ended_bounding = has_bnd;
 	parse_status_defenses(pid, uid, &p->defenses, &secure_nondefault,
-		&secbits_raw, seen_no_new_privs, no_new_privs,
-		seen_seccomp, seccomp, seen_secbits, secbits);
+		&secbits_raw, &sf);
 	p->securebits_locked = p->defenses.securebits_locked &&
 		strcmp(p->defenses.securebits_locked, "yes") == 0;
 	if (!p->comm || (exelen >= 0 && !p->exe) || !p->caps ||
@@ -1266,6 +1542,11 @@ static void collect_proc_inodes(struct model *m)
 			fdnum = atoi(fdent->d_name);
 			if (fdnum < 0)
 				continue;
+			/*
+			 * Probe SO_REUSEPORT here because this is the only stage with both
+			 * target pid and fd number for pidfd_getfd; store on inode_proc so
+			 * endpoint projection can reuse the result later.
+			 */
 			reuseport = probe_reuseport(pid, fdnum);
 			if (reuseport != 1)
 				continue;
@@ -1301,7 +1582,8 @@ static struct inode_proc *lookup_inode(struct model *m, unsigned long inode)
  * add_endpoint - add/merge one inet or packet endpoint in @m.
  * @m: model receiving endpoint data.
  * @proto/@bind/@ifname/@ifaddr: copied strings for endpoint identity.
- * @port/@plane/@wildcard: endpoint attributes for rendering/flags.
+ * @port/@plane: endpoint attributes for rendering/grouping.
+ * @attrs: wildcard/reuseport flags carried from parser/projection stages.
  * @ip: inode-owner mapping whose process pointers are attached to endpoint.
  *
  * Returns 0 on success, -1 on allocation failure.
@@ -1310,7 +1592,7 @@ static struct inode_proc *lookup_inode(struct model *m, unsigned long inode)
  */
 static int add_endpoint(struct model *m, const char *proto, const char *bind,
 	unsigned int port, enum plane_kind plane, const char *ifname,
-	const char *ifaddr, int wildcard, int reuseport,
+	const char *ifaddr, const struct endpoint_attrs *attrs,
 	struct inode_proc *ip)
 {
 	size_t i, j;
@@ -1326,7 +1608,7 @@ static int add_endpoint(struct model *m, const char *proto, const char *bind,
 		e = &m->eps[i];
 		if (strcmp(e->label, label) == 0 && strcmp(e->ifname, ifname) == 0 &&
 		    strcmp(e->ifaddr, ifaddr) == 0) {
-			e->reuseport |= reuseport;
+			e->reuseport |= attrs->reuseport;
 			goto add_procs;
 		}
 	}
@@ -1344,8 +1626,8 @@ static int add_endpoint(struct model *m, const char *proto, const char *bind,
 	e->plane = plane;
 	e->ifname = xstrdup(ifname);
 	e->ifaddr = xstrdup(ifaddr);
-	e->wildcard_bind = wildcard;
-	e->reuseport = reuseport;
+	e->wildcard_bind = attrs->wildcard;
+	e->reuseport = attrs->reuseport;
 	if (!e->proto || !e->bind || !e->label || !e->ifname || !e->ifaddr) {
 		free(e->proto);
 		free(e->bind);
@@ -1464,6 +1746,10 @@ static void endpoint_to_ifaces(struct model *m, const char *proto, int af,
 	int wildcard = str_is_wildcard(af, bind);
 	int multicast = str_is_multicast(af, bind);
 	int matched = 0;
+	struct endpoint_attrs attrs;
+
+	attrs.wildcard = wildcard;
+	attrs.reuseport = reuseport;
 
 	for (i = 0; i < m->ifaces_n; i++) {
 		struct iface_info *ifc = &m->ifaces[i];
@@ -1478,15 +1764,13 @@ static void endpoint_to_ifaces(struct model *m, const char *proto, int af,
 				if (strcmp(ifc->name, "lo") == 0)
 					continue;
 				add_endpoint(m, proto, bind, port, PLANE_INET_EXTERNAL,
-					ifc->name, ifc->addrs[j].addr, 1,
-					reuseport, ip);
+					ifc->name, ifc->addrs[j].addr, &attrs, ip);
 				matched = 1;
 			} else if (strcmp(ifc->addrs[j].addr, bind) == 0) {
 				enum plane_kind plane = str_is_loopback(af, bind) ?
 					PLANE_INET_LOOPBACK : PLANE_INET_EXTERNAL;
 				add_endpoint(m, proto, bind, port, plane, ifc->name,
-					ifc->addrs[j].addr, 0,
-					reuseport, ip);
+					ifc->addrs[j].addr, &attrs, ip);
 				matched = 1;
 			}
 		}
@@ -1497,7 +1781,7 @@ static void endpoint_to_ifaces(struct model *m, const char *proto, int af,
 			PLANE_INET_LOOPBACK : PLANE_INET_EXTERNAL,
 			str_is_loopback(af, bind) ? "lo" :
 			(multicast ? "multicast/group" : "unknown"),
-			bind, wildcard, reuseport, ip);
+			bind, &attrs, ip);
 }
 
 /*
@@ -1613,6 +1897,7 @@ static void parse_packet_file(struct model *m)
 		unsigned long sk, inode;
 		unsigned int ref, type, proto, iface, r, rmem, uid;
 		struct inode_proc *ip;
+		struct endpoint_attrs attrs;
 		char bind[64], addr[64], name[64];
 
 		if (!row++)
@@ -1629,8 +1914,10 @@ static void parse_packet_file(struct model *m)
 		snprintf(bind, sizeof(bind), "::");
 		snprintf(addr, sizeof(addr), "ifindex:%u", iface);
 		snprintf(name, sizeof(name), "packet");
+		attrs.wildcard = 0;
+		attrs.reuseport = 0;
 		add_endpoint(m, name, bind, proto, PLANE_PACKET, ifn, addr,
-			0, 0, ip);
+			&attrs, ip);
 	}
 	fclose(f);
 }
@@ -2105,14 +2392,118 @@ static void collect_endpoints(struct model *m)
  * Side effects/assumptions: Operates on in-memory data and may read
  * procfs/netns state; it does not change kernel configuration.
  */
+enum color_state {
+	COLOR_STATE_NONE,
+	COLOR_STATE_ORANGE,
+	COLOR_STATE_YELLOW,
+	COLOR_STATE_GREEN,
+};
+
+/*
+ * color_state_code - map parser color state to ANSI start sequence.
+ * @st: tracked color state carried across wrapped lines.
+ *
+ * Returns SGR color code for @st, or NULL for default color.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
+static const char *color_state_code(enum color_state st)
+{
+	switch (st) {
+	case COLOR_STATE_ORANGE:
+		return COLOR_ORANGE;
+	case COLOR_STATE_YELLOW:
+		return COLOR_YELLOW;
+	case COLOR_STATE_GREEN:
+		return COLOR_GREEN;
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * skip_ansi_sgr - advance index past one ANSI SGR escape sequence.
+ * @text: source string potentially containing SGR escapes.
+ * @i: current index, expected at ESC byte when sequence starts.
+ *
+ * Returns new index after sequence (or unchanged when not at SGR).
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
+static int skip_ansi_sgr(const char *text, int i)
+{
+	if (text[i] != '\033' || text[i + 1] != '[')
+		return i;
+	i += 2;
+	while (text[i] && text[i] != 'm')
+		i++;
+	if (text[i] == 'm')
+		i++;
+	return i;
+}
+
+/*
+ * scan_color_state - track active color state across wrapped text spans.
+ * @text: source string segment being scanned.
+ * @from: start index (inclusive) of rendered segment.
+ * @to: end index (exclusive) of rendered segment.
+ * @st: incoming color state before scanning @text[@from:@to].
+ *
+ * Returns resulting color state after processing embedded SGR escapes.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
+static enum color_state scan_color_state(const char *text, int from, int to,
+	enum color_state st)
+{
+	int i;
+
+	for (i = from; i < to && text[i]; ) {
+		if (text[i] == '\033' && text[i + 1] == '[') {
+			if (strncmp(text + i, COLOR_ORANGE, strlen(COLOR_ORANGE)) == 0) {
+				st = COLOR_STATE_ORANGE;
+				i += strlen(COLOR_ORANGE);
+				continue;
+			}
+			if (strncmp(text + i, COLOR_YELLOW, strlen(COLOR_YELLOW)) == 0) {
+				st = COLOR_STATE_YELLOW;
+				i += strlen(COLOR_YELLOW);
+				continue;
+			}
+			if (strncmp(text + i, COLOR_GREEN, strlen(COLOR_GREEN)) == 0) {
+				st = COLOR_STATE_GREEN;
+				i += strlen(COLOR_GREEN);
+				continue;
+			}
+			if (strncmp(text + i, COLOR_RESET, strlen(COLOR_RESET)) == 0) {
+				st = COLOR_STATE_NONE;
+				i += strlen(COLOR_RESET);
+				continue;
+			}
+			i = skip_ansi_sgr(text, i);
+			continue;
+		}
+		i++;
+	}
+	return st;
+}
+
 static int wrap_to(const char *text, int from, int limit)
 {
 	int i;
+	int vis = 0;
 	int space = -1;
 
-	for (i = from; text[i] && (i - from) < limit; i++)
+	for (i = from; text[i] && vis < limit; ) {
+		if (text[i] == '\033' && text[i + 1] == '[') {
+			i = skip_ansi_sgr(text, i);
+			continue;
+		}
 		if (text[i] == ' ')
 			space = i;
+		i++;
+		vis++;
+	}
 	if (!text[i])
 		return i;
 	if (space > from)
@@ -2140,6 +2531,7 @@ static void print_tree_node(const char *prefix, int is_last, const char *txt,
 	char cont[512];
 	int pos = 0;
 	int first = 1;
+	enum color_state st = COLOR_STATE_NONE;
 
 	snprintf(head, sizeof(head), "%s%s", prefix,
 		is_last ? "└─ " : "├─ ");
@@ -2150,6 +2542,7 @@ static void print_tree_node(const char *prefix, int is_last, const char *txt,
 		int lead_len = strlen(lead);
 		int avail = width - lead_len;
 		int to;
+		const char *code;
 
 		if (avail < 10)
 			avail = 10;
@@ -2158,7 +2551,15 @@ static void print_tree_node(const char *prefix, int is_last, const char *txt,
 			return;
 		}
 		to = wrap_to(txt, pos, avail);
-		printf("%s%.*s\n", lead, to - pos, txt + pos);
+		printf("%s", lead);
+		code = color_state_code(st);
+		if (!first && code)
+			fputs(code, stdout);
+		printf("%.*s", to - pos, txt + pos);
+		st = scan_color_state(txt, pos, to, st);
+		if (st != COLOR_STATE_NONE)
+			fputs(COLOR_RESET, stdout);
+		putchar('\n');
 		while (txt[to] == ' ')
 			to++;
 		pos = to;
@@ -2199,6 +2600,10 @@ static void build_child_prefix(char *dst, size_t dst_sz, const char *prefix,
 static int endpoint_cmp(const void *a, const void *b)
 {
 	const struct endpoint *ea = a, *eb = b;
+	/*
+	 * Sort by plane for single-pass render grouping, then interface/protocol,
+	 * then bind (wildcards first), then port, then ifaddr/label for stability.
+	 */
 	if (ea->plane != eb->plane)
 		return ea->plane - eb->plane;
 	if (strcmp(ea->ifname, eb->ifname) != 0)
@@ -2215,6 +2620,15 @@ static int endpoint_cmp(const void *a, const void *b)
 }
 
 
+/*
+ * format_bind_node - normalize bind text for tree display.
+ * @dst: output buffer receiving display text.
+ * @dst_sz: size of @dst in bytes.
+ * @bind: endpoint bind address to format.
+ *
+ * Returns no value.
+ * Side effects/assumptions: Writes formatted bind label into @dst.
+ */
 static void format_bind_node(char *dst, size_t dst_sz, const char *bind)
 {
 	if (strcmp(bind, "0.0.0.0") == 0 || strcmp(bind, "::") == 0)
@@ -2225,6 +2639,15 @@ static void format_bind_node(char *dst, size_t dst_sz, const char *bind)
 		snprintf(dst, dst_sz, "%s", bind);
 }
 
+/*
+ * bind_sort_cmp - compare bind addresses with wildcard-first ordering.
+ * @a: first bind address.
+ * @b: second bind address.
+ *
+ * Returns negative/zero/positive ordering suitable for qsort tie-breaks.
+ * Side effects/assumptions: Operates on in-memory data and may read
+ * procfs/netns state; it does not change kernel configuration.
+ */
 static int bind_sort_cmp(const char *a, const char *b)
 {
 	int a_star = strcmp(a, "0.0.0.0") == 0 || strcmp(a, "::") == 0;
@@ -2235,19 +2658,31 @@ static int bind_sort_cmp(const char *a, const char *b)
 	return strcmp(a, b);
 }
 
+/*
+ * render_tree_process_details - emit one process subtree under an endpoint.
+ * @prefix: parent tree prefix for process node.
+ * @is_last: non-zero when process node is final sibling.
+ * @p: process metadata to render.
+ * @e: endpoint context supplying endpoint-derived flags.
+ * @width: display width used for wrapping rendered nodes.
+ *
+ * Returns no value.
+ * Side effects/assumptions: Writes formatted tree output to stdout.
+ */
 static void render_tree_process_details(const char *prefix,
-					int is_last,
+						int is_last,
 					struct process_info *p,
 					const struct endpoint *e,
 					int width)
 {
 	char pfx_child[256], pfx_def[256], pfx_flags[256];
-	char line[512];
+	char line[4096];
 	const char *def_nodes[8];
 	char def_buf[8][512];
 	size_t def_n = 0;
 	size_t ai;
 	unsigned int flags = 0;
+	enum cap_severity priv_sev = caps_worst_severity(p->caps);
 
 	snprintf(line, sizeof(line), "%s (pid=%d uid=%d%s%s%s%s)",
 		p->comm, p->pid, p->uid,
@@ -2258,66 +2693,189 @@ static void render_tree_process_details(const char *prefix,
 	print_tree_node(prefix, is_last, line, width);
 	build_child_prefix(pfx_child, sizeof(pfx_child), prefix, is_last);
 
-	snprintf(line, sizeof(line), "caps: %s", p->caps);
-	print_tree_node(pfx_child, 0, line, width);
-	if (p->ambient_caps) {
-		snprintf(line, sizeof(line), "ambient: %s", p->ambient_caps);
-		print_tree_node(pfx_child, 0, line, width);
-	}
-	if (p->ambient_present || p->open_ended_bounding) {
-		int n;
-		size_t off = 0;
+	if (strcmp(p->caps, "(full)") == 0 || strcmp(p->caps, "(none)") == 0) {
+		const char *c = strcmp(p->caps, "(full)") == 0 ? COLOR_ORANGE :
+			COLOR_GREEN;
+		if (use_color)
+			snprintf(line, sizeof(line), "caps: %s%s%s", c, p->caps,
+				COLOR_RESET);
+		else
+			snprintf(line, sizeof(line), "caps: %s", p->caps);
+	} else {
+		char capsbuf[3072] = "";
+		char *tmp = xstrdup(p->caps);
+		char *save = NULL;
+		char *tok;
+		int first = 1;
 
-		n = snprintf(line + off, sizeof(line) - off, "findings:");
-		if (n > 0) {
-			if ((size_t)n >= sizeof(line) - off)
-				off = sizeof(line) - 1;
-			else
-				off += (size_t)n;
-		}
-		if (p->ambient_present && off < sizeof(line)) {
-			n = snprintf(line + off, sizeof(line) - off,
-				" [ambient-present]");
-			if (n > 0) {
-				if ((size_t)n >= sizeof(line) - off)
-					off = sizeof(line) - 1;
+		if (!tmp) {
+			snprintf(line, sizeof(line), "caps: %s", p->caps);
+		} else {
+			for (tok = strtok_r(tmp, ",", &save); tok;
+			     tok = strtok_r(NULL, ",", &save)) {
+				char part[256];
+				char *t = tok;
+				enum cap_severity sev;
+				while (*t == ' ')
+					t++;
+				sev = cap_name_severity(t);
+				if (use_color && sev_color(sev))
+					snprintf(part, sizeof(part), "%s%s%s",
+						sev_color(sev), t, COLOR_RESET);
 				else
-					off += (size_t)n;
+					snprintf(part, sizeof(part), "%s", t);
+				if (!first)
+					strncat(capsbuf, ", ", sizeof(capsbuf)-strlen(capsbuf)-1);
+				strncat(capsbuf, part, sizeof(capsbuf)-strlen(capsbuf)-1);
+				first = 0;
 			}
+			free(tmp);
+			if (p->ambient_present) {
+				if (use_color)
+					strncat(capsbuf, " [\033[38;5;208mambient-present\033[0m]",
+						sizeof(capsbuf)-strlen(capsbuf)-1);
+				else
+					strncat(capsbuf, " [ambient-present]",
+						sizeof(capsbuf)-strlen(capsbuf)-1);
+			}
+			if (p->open_ended_bounding) {
+				if (use_color && strcmp(p->caps, "(full)") != 0 &&
+				    caps_contains_token(p->caps, "setpcap"))
+					strncat(capsbuf,
+						" [\033[38;5;208mopen-ended-bounding\033[0m]",
+						sizeof(capsbuf) - strlen(capsbuf) - 1);
+				else
+					strncat(capsbuf, " [open-ended-bounding]",
+						sizeof(capsbuf) - strlen(capsbuf) - 1);
+			}
+			snprintf(line, sizeof(line), "caps: %s", capsbuf);
 		}
-		if (p->open_ended_bounding && off < sizeof(line)) {
-			snprintf(line + off, sizeof(line) - off,
-				" [open-ended-bounding]");
-		}
+	}
+	print_tree_node(pfx_child, 0, line, width);
+
+	if (p->ambient_caps) {
+		if (use_color)
+			snprintf(line, sizeof(line), "ambient: %s%s%s", COLOR_ORANGE,
+				p->ambient_caps, COLOR_RESET);
+		else
+			snprintf(line, sizeof(line), "ambient: %s", p->ambient_caps);
 		print_tree_node(pfx_child, 0, line, width);
 	}
 
 	snprintf(def_buf[def_n], sizeof(def_buf[def_n]),
-		DEFENSES_RUNS_AS_KEY ": %s",
-		p->defenses.runs_as_nonroot);
+		DEFENSES_RUNS_AS_KEY ": %s%s%s",
+		strcmp(p->defenses.runs_as_nonroot, "yes") == 0 && use_color ? COLOR_GREEN :
+		(strcmp(p->defenses.runs_as_nonroot, "no") == 0 && use_color ? COLOR_YELLOW : ""),
+		p->defenses.runs_as_nonroot,
+		use_color && (strcmp(p->defenses.runs_as_nonroot, "yes") == 0 ||
+		 strcmp(p->defenses.runs_as_nonroot, "no") == 0) ? COLOR_RESET : "");
 	def_nodes[def_n] = def_buf[def_n];
 	def_n++;
-	snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "no_new_privs: %s",
-		p->defenses.no_new_privs);
+
+	if (strcmp(p->defenses.no_new_privs, "yes") == 0 && use_color)
+		snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "no_new_privs: %syes%s",
+			COLOR_GREEN, COLOR_RESET);
+	else if (strcmp(p->defenses.no_new_privs, "no") == 0 && use_color)
+		snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "no_new_privs: %sno%s",
+			COLOR_YELLOW, COLOR_RESET);
+	else
+		snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "no_new_privs: %s",
+			p->defenses.no_new_privs);
 	def_nodes[def_n] = def_buf[def_n];
 	def_n++;
-	snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "seccomp: %s",
-		p->defenses.seccomp);
+
+	if ((strcmp(p->defenses.seccomp, "filter") == 0 ||
+	     strcmp(p->defenses.seccomp, "strict") == 0) && use_color)
+		snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "seccomp: %s%s%s",
+			COLOR_GREEN, p->defenses.seccomp, COLOR_RESET);
+	else if (strcmp(p->defenses.seccomp, "disabled") == 0 && use_color)
+		snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "seccomp: %sdisabled%s",
+			COLOR_YELLOW, COLOR_RESET);
+	else
+		snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "seccomp: %s",
+			p->defenses.seccomp);
 	def_nodes[def_n] = def_buf[def_n];
 	def_n++;
+
 	if (p->defenses.lsm_label) {
-		snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "lsm: %s",
-			p->defenses.lsm_label);
+		if (use_color && strstr(p->defenses.lsm_label, "unconfined_t"))
+			snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "lsm: %s%s%s",
+				COLOR_ORANGE, p->defenses.lsm_label, COLOR_RESET);
+		else if (use_color && p->defenses.lsm_label[0])
+			snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "lsm: %s%s%s",
+				COLOR_GREEN, p->defenses.lsm_label, COLOR_RESET);
+		else
+			snprintf(def_buf[def_n], sizeof(def_buf[def_n]), "lsm: %s",
+				p->defenses.lsm_label);
 		def_nodes[def_n] = def_buf[def_n];
 		def_n++;
 	}
 	if (p->defenses.securebits) {
-		snprintf(def_buf[def_n], sizeof(def_buf[def_n]),
-			"securebits: %s", p->defenses.securebits);
-		def_nodes[def_n] = def_buf[def_n];
-		def_n++;
-		snprintf(def_buf[def_n], sizeof(def_buf[def_n]),
-			"securebits_locked: %s", p->defenses.securebits_locked);
+		const char *keep_caps = "unknown";
+		const char *fixup = "unknown";
+		const char *noroot = "unknown";
+		const char *locked = p->defenses.securebits_locked ?
+			p->defenses.securebits_locked : "unknown";
+		char sb_color[512];
+		char sb_plain[256];
+		const char *keep_color = "";
+		const char *fixup_color = "";
+		const char *noroot_color = "";
+		const char *locked_color = "";
+
+		if (strstr(p->defenses.securebits, "keep_caps=yes"))
+			keep_caps = "yes";
+		else if (strstr(p->defenses.securebits, "keep_caps=no"))
+			keep_caps = "no";
+
+		if (strstr(p->defenses.securebits, "no_setuid_fixup=yes"))
+			fixup = "yes";
+		else if (strstr(p->defenses.securebits, "no_setuid_fixup=no"))
+			fixup = "no";
+
+		if (strstr(p->defenses.securebits, "noroot=yes"))
+			noroot = "yes";
+		else if (strstr(p->defenses.securebits, "noroot=no"))
+			noroot = "no";
+
+		snprintf(sb_plain, sizeof(sb_plain),
+			"keep_caps=%s no_setuid_fixup=%s noroot=%s (locked: %s)",
+			keep_caps, fixup, noroot, locked);
+
+		if (use_color) {
+			if (strcmp(keep_caps, "yes") == 0)
+				keep_color = COLOR_YELLOW;
+
+			if (strcmp(fixup, "yes") == 0)
+				fixup_color = COLOR_YELLOW;
+
+			if (strcmp(noroot, "yes") == 0)
+				noroot_color = COLOR_GREEN;
+			else if (strcmp(noroot, "no") == 0)
+				noroot_color = COLOR_YELLOW;
+
+			if (strcmp(locked, "yes") == 0)
+				locked_color = COLOR_GREEN;
+			else if (strcmp(locked, "no") == 0)
+				locked_color = COLOR_YELLOW;
+
+			snprintf(sb_color, sizeof(sb_color),
+				"keep_caps=%s%s%s no_setuid_fixup=%s%s%s noroot=%s%s%s "
+				"(locked: %s%s%s)",
+				keep_color, keep_caps,
+				keep_color[0] ? COLOR_RESET : "",
+				fixup_color, fixup,
+				fixup_color[0] ? COLOR_RESET : "",
+				noroot_color, noroot,
+				noroot_color[0] ? COLOR_RESET : "",
+				locked_color, locked,
+				locked_color[0] ? COLOR_RESET : "");
+			snprintf(def_buf[def_n], sizeof(def_buf[def_n]),
+				"securebits: %s", sb_color);
+		} else {
+			snprintf(def_buf[def_n], sizeof(def_buf[def_n]),
+				"securebits: %s", sb_plain);
+		}
 		def_nodes[def_n] = def_buf[def_n];
 		def_n++;
 	}
@@ -2344,9 +2902,19 @@ static void render_tree_process_details(const char *prefix,
 
 	print_tree_node(pfx_child, 1, "flags", width);
 	build_child_prefix(pfx_flags, sizeof(pfx_flags), pfx_child, 1);
-	print_flag_nodes(pfx_flags, width, flags);
+	print_flag_nodes(pfx_flags, width, flags, priv_sev);
 }
 
+
+/*
+ * render_json_process - emit one process object inside endpoint JSON arrays.
+ * @p: process metadata record to serialize.
+ * @ep: endpoint context contributing endpoint-related flags.
+ * @indent: indentation prefix already prepared by caller.
+ *
+ * Returns no value.
+ * Side effects/assumptions: Writes JSON fragments to stdout.
+ */
 static void render_json_process(struct process_info *p,
 				const struct endpoint *ep,
 				const char *indent)
@@ -2439,7 +3007,7 @@ static void render_json_process(struct process_info *p,
 static void render_tree(struct model *m)
 {
 	size_t i;
-	int planes[4];
+	int planes[PLANE_COUNT];
 	size_t plane_n = 0;
 	int width = get_width();
 
@@ -2457,6 +3025,7 @@ static void render_tree(struct model *m)
 	}
 
 	for (i = 0; i < plane_n; i++) {
+		/* Tree level: plane (INET external/loopback, packet, vsock). */
 		int plane = planes[i];
 		int plane_last = (i + 1 == plane_n);
 		char pfx_plane[256] = "";
@@ -2502,6 +3071,7 @@ static void render_tree(struct model *m)
 		}
 
 		while (j < m->eps_n) {
+			/* Tree level: interface grouping within the current plane. */
 			size_t iface_start, iface_end;
 			char iface_line[160];
 			char pfx_iface_child[256];
@@ -2536,6 +3106,7 @@ static void render_tree(struct model *m)
 					pfx_iface_child);
 
 				for (j = iface_start; j < iface_end; ) {
+					/* Tree level: protocol grouping on this interface. */
 					size_t proto_start = j, proto_end;
 					char pfx_bind[256];
 					int proto_last;
@@ -2547,8 +3118,19 @@ static void render_tree(struct model *m)
 						proto_end++;
 					proto_last = (proto_end == iface_end);
 
-					print_tree_node(pfx_proto_root, proto_last,
-						m->eps[proto_start].proto, width);
+					/* Highlight higher-risk raw/packet protocol families. */
+					if (use_color && (strcmp(m->eps[proto_start].proto, "raw") == 0 ||
+					    strcmp(m->eps[proto_start].proto, "raw6") == 0 ||
+					    strcmp(m->eps[proto_start].proto, "packet") == 0)) {
+						char pbuf[64];
+
+						snprintf(pbuf, sizeof(pbuf), "%s%s%s", COLOR_YELLOW,
+							m->eps[proto_start].proto, COLOR_RESET);
+						print_tree_node(pfx_proto_root, proto_last, pbuf, width);
+					} else {
+						print_tree_node(pfx_proto_root, proto_last,
+							m->eps[proto_start].proto, width);
+					}
 					build_child_prefix(pfx_bind, sizeof(pfx_bind),
 						pfx_proto_root, proto_last);
 
@@ -2556,6 +3138,7 @@ static void render_tree(struct model *m)
 						size_t bi = proto_start;
 
 						while (bi < proto_end) {
+							/* Tree level: bind address (wildcard/specific). */
 							size_t bind_start = bi;
 							size_t bind_end;
 							char bind_line[128], pfx_port[256];
@@ -2575,6 +3158,7 @@ static void render_tree(struct model *m)
 								pfx_bind, bind_last);
 
 							for (bi = bind_start; bi < bind_end; ) {
+								/* Tree level: port number under each bind. */
 								size_t port_start = bi;
 								size_t port_end;
 								char pfx_proc[256], port_line[64];
@@ -2602,6 +3186,7 @@ static void render_tree(struct model *m)
 								}
 
 								for (k = port_start; k < port_end; k++) {
+									/* Tree level: process details under the current port. */
 									struct endpoint *e = &m->eps[k];
 									size_t pi;
 
@@ -2610,6 +3195,10 @@ static void render_tree(struct model *m)
 										struct process_info *p = e->procs[pi];
 										int proc_last;
 
+										/*
+										 * Deduplicate processes that appear under multiple
+										 * endpoints sharing this grouped port.
+										 */
 										seen_rc = pidset_test_and_add(&seen, p->pid);
 										if (seen_rc)
 											continue;
@@ -2902,6 +3491,7 @@ int netcap_advanced_main(const struct netcap_opts *opts)
 	}
 	collect_proc_inodes(&m);
 	collect_endpoints(&m);
+	use_color = !opts->json && !opts->no_color && isatty(STDOUT_FILENO);
 	if (opts->json)
 		render_json(&m);
 	else
