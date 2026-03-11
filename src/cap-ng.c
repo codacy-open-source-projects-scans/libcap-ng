@@ -215,11 +215,16 @@ static inline int test_cap(unsigned int cap)
 static void init_lib(void) __attribute__ ((constructor));
 static void init_lib(void)
 {
-       // This is so dynamic libraries don't re-init
-       static unsigned int run_once = 0;
-       if (run_once)
-               return;
-       run_once = 1;
+	/* This is so that dynamic or static libraries don't re-init */
+	static unsigned int run_once;
+
+	if (__atomic_load_n(&run_once, __ATOMIC_ACQUIRE) == 2)
+		return;
+	if (!__sync_bool_compare_and_swap(&run_once, 0, 1)) {
+		while (__atomic_load_n(&run_once, __ATOMIC_ACQUIRE) != 2)
+			;
+		return;
+	}
 
 #ifdef HAVE_PTHREAD_H
 	pthread_atfork(NULL, NULL, deinit);
@@ -291,6 +296,7 @@ fail:
 	if (!errno)
 		HAVE_PR_CAP_AMBIENT = 1;
 #endif
+	__atomic_store_n(&run_once, 2, __ATOMIC_RELEASE);
 }
 
 static void init(void)
@@ -789,6 +795,10 @@ int capng_apply(capng_select_t set)
 	// Before updating, we expect that the data is initialized to something
 	if (m.state < CAPNG_INIT)
 		return -1;
+	if (set == 0) {
+		errno = EINVAL;
+		return -1;
+	}
 
 	if (set & CAPNG_SELECT_BOUNDS) {
 #ifdef PR_CAPBSET_DROP
@@ -1447,39 +1457,62 @@ if (HAVE_PR_CAP_AMBIENT) {
 
 char *capng_print_caps_text(capng_print_t where, capng_type_t which)
 {
-	unsigned int i, once = 0, cnt = 0;
+	unsigned int i, cnt = 0;
+	size_t total = 1;
+	int found = 0;
 	char *ptr = NULL;
 
 	if (m.state < CAPNG_INIT)
 		return ptr;
 
+	if (where == CAPNG_PRINT_BUFFER) {
+		for (i=0; i<=last_cap; i++) {
+			if (capng_have_capability(which, i)) {
+				const char *n = capng_capability_to_name(i);
+				size_t len;
+
+				if (n == NULL)
+					n = "unknown";
+				len = strlen(n);
+				total += len;
+				if (found)
+					total += 2;
+				found = 1;
+			}
+		}
+		if (found) {
+			ptr = malloc(total);
+			if (ptr == NULL)
+				return ptr;
+		}
+		found = 0;
+	}
+
 	for (i=0; i<=last_cap; i++) {
 		if (capng_have_capability(which, i)) {
 			const char *n = capng_capability_to_name(i);
+			size_t len;
+
 			if (n == NULL)
 				n = "unknown";
+			len = strlen(n);
 			if (where == CAPNG_PRINT_STDOUT) {
-				if (once == 0) {
+				if (found == 0)
 					printf("%s", n);
-					once++;
-				} else
+				else
 					printf(", %s", n);
 			} else if (where == CAPNG_PRINT_BUFFER) {
-				int len;
-				if (once == 0) {
-					ptr = malloc(last_cap*20);
-					if (ptr == NULL)
-						return ptr;
-					len = sprintf(ptr+cnt, "%s", n);
-					once++;
-				} else
-					len = sprintf(ptr+cnt, ", %s", n);
-				if (len > 0)
-					cnt+=len;
+				if (found) {
+					ptr[cnt++] = ',';
+					ptr[cnt++] = ' ';
+				}
+				memcpy(ptr + cnt, n, len + 1);
+				cnt += len;
 			}
+			found = 1;
 		}
 	}
-	if (once == 0) {
+	if (found == 0) {
 		if (where == CAPNG_PRINT_STDOUT)
 			printf("none");
 		else
@@ -1506,4 +1539,3 @@ void capng_restore_state(void **state)
 		*state = NULL;
 	}
 }
-
