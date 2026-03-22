@@ -64,12 +64,6 @@ unsigned int last_cap hidden = 0;
 #ifdef PR_CAPBSET_DROP
 static int HAVE_PR_CAPBSET_DROP = 0;
 #endif
-#ifdef PR_SET_SECUREBITS
-static int HAVE_PR_SET_SECUREBITS = 0;
-#endif
-#ifdef PR_SET_NO_NEW_PRIVS
-static int HAVE_PR_SET_NO_NEW_PRIVS = 0;
-#endif
 #ifdef PR_CAP_AMBIENT
 static int HAVE_PR_CAP_AMBIENT = 0;
 #endif
@@ -278,25 +272,13 @@ fail:
 #ifdef PR_CAPBSET_DROP
 	errno = 0;
 	prctl(PR_CAPBSET_READ, 0, 0, 0, 0);
-	if (!errno)
+	if (errno != EINVAL)
 		HAVE_PR_CAPBSET_DROP = 1;
-#endif
-#ifdef PR_SET_SECUREBITS
-	errno = 0;
-	prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
-	if (!errno)
-		HAVE_PR_SET_SECUREBITS = 1;
-#endif
-#ifdef PR_SET_NO_NEW_PRIVS
-	errno = 0;
-	prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-	if (!errno)
-		HAVE_PR_SET_NO_NEW_PRIVS = 1;
 #endif
 #ifdef PR_CAP_AMBIENT
 	errno = 0;
-	prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, 0, 0, 0);
-	if (!errno)
+	prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0);
+	if (errno != EINVAL)
 		HAVE_PR_CAP_AMBIENT = 1;
 #endif
 	__atomic_store_n(&run_once, 2, __ATOMIC_RELEASE);
@@ -462,9 +444,11 @@ static int get_bounding_set(void)
 		while (fgets(buf, sizeof(buf), f)) {
 			if (strncmp(buf, "CapB", 4))
 				continue;
-			sscanf(buf, "CapBnd:  %08x%08x",
+			int num = sscanf(buf, "CapBnd:  %08x%08x",
 			       &m.bounds[1], &m.bounds[0]);
 			fclose(f);
+			if (num != 2)
+				return -1;
 			return 0;
 		}
 		// Didn't find bounding set, fall through and try prctl way
@@ -507,9 +491,11 @@ static int get_ambient_set(void)
 		while (fgets(buf, sizeof(buf), f)) {
 			if (strncmp(buf, "CapA", 4))
 				continue;
-			sscanf(buf, "CapAmb:  %08x%08x",
+			int num = sscanf(buf, "CapAmb:  %08x%08x",
 			       &m.ambient[1], &m.ambient[0]);
 			fclose(f);
+			if (num != 2)
+				return -1;
 			return 0;
 		}
 		fclose(f);
@@ -822,11 +808,11 @@ if (HAVE_PR_CAPBSET_DROP) {
 				    }
 				}
 			}
-			m.state = CAPNG_APPLIED;
 			if (get_bounding_set() < 0) {
 				rc = -3;
 				goto try_caps;
 			}
+			m.state = CAPNG_APPLIED;
 		} else {
 			memcpy(&m, &state, sizeof(m)); /* restore state */
 			rc = -4;
@@ -1011,7 +997,7 @@ if (HAVE_PR_CAPBSET_DROP) {
 	}
 
 	// Tell system we want to keep caps across uid change
-	if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0))
+	if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
 		return -2;
 
 	// Change to the temp capabilities
@@ -1081,7 +1067,7 @@ if (HAVE_PR_CAPBSET_DROP) {
 
 	// Tell it we are done keeping capabilities
 	rc = prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0);
-	if (rc)
+	if (rc < 0)
 		return -7;
 
 	// Now throw away CAP_SETPCAP so no more changes
@@ -1099,8 +1085,6 @@ if (HAVE_PR_CAPBSET_DROP) {
 	if (rc < 0)
 		return -9;
 
-	// Done
-	m.state = CAPNG_UPDATED;
 	return 0;
 
 err_out:
@@ -1112,23 +1096,17 @@ int capng_lock(void)
 {
 	// If either fail, return -1 since something is not right
 #ifdef PR_SET_SECUREBITS
-if (HAVE_PR_SET_SECUREBITS) {
-	int rc = prctl(PR_SET_SECUREBITS,
+	if (prctl(PR_SET_SECUREBITS,
 			1 << SECURE_NOROOT |
 			1 << SECURE_NOROOT_LOCKED |
 			1 << SECURE_NO_SETUID_FIXUP |
-			1 << SECURE_NO_SETUID_FIXUP_LOCKED, 0, 0, 0);
+			1 << SECURE_NO_SETUID_FIXUP_LOCKED, 0, 0, 0) < 0)
+		return -1;
+#endif
 #ifdef PR_SET_NO_NEW_PRIVS
-if (HAVE_PR_SET_NO_NEW_PRIVS) {
-	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
 		return -1;
-}
 #endif
-	if (rc)
-		return -1;
-}
-#endif
-
 	return 0;
 }
 
@@ -1191,8 +1169,8 @@ if (HAVE_PR_CAPBSET_DROP) {
 		else
 			return CAPNG_PARTIAL;
 	}
-} else
-	empty = 1;
+} else if (set & CAPNG_SELECT_BOUNDS)
+	empty = 1; // Only report empty if they asked about it
 #endif
 #ifdef PR_CAP_AMBIENT
 if (HAVE_PR_CAP_AMBIENT) {
@@ -1210,8 +1188,8 @@ if (HAVE_PR_CAP_AMBIENT) {
 		else
 			return CAPNG_PARTIAL;
 	}
-} else
-	empty = 1;
+} else if (set & CAPNG_SELECT_AMBIENT)
+	empty = 1; // Only report empty if they asked about it
 #endif
 	if (empty == 1 && full == 0)
 		return CAPNG_NONE;
