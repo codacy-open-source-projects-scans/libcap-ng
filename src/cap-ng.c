@@ -413,11 +413,14 @@ int capng_set_rootid(int rootid)
 	if (m.state == CAPNG_ERROR)
 		return -1;
 
-	if (rootid < 0)
+	if (rootid < 0 && rootid != CAPNG_UNSET_ROOTID)
 		return -1;
 
 	m.rootid = rootid;
-	m.vfs_cap_ver = 3;
+	if (rootid == CAPNG_UNSET_ROOTID)
+		m.vfs_cap_ver = 2;
+	else
+		m.vfs_cap_ver = 3;
 
 	return 0;
 #else
@@ -1094,6 +1097,8 @@ err_out:
 
 int capng_lock(void)
 {
+	int rc = 0;
+
 	// If either fail, return -1 since something is not right
 #ifdef PR_SET_SECUREBITS
 	if (prctl(PR_SET_SECUREBITS,
@@ -1101,13 +1106,13 @@ int capng_lock(void)
 			1 << SECURE_NOROOT_LOCKED |
 			1 << SECURE_NO_SETUID_FIXUP |
 			1 << SECURE_NO_SETUID_FIXUP_LOCKED, 0, 0, 0) < 0)
-		return -1;
+		rc = -1;
 #endif
 #ifdef PR_SET_NO_NEW_PRIVS
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-		return -1;
+		rc += -2;
 #endif
-	return 0;
+	return rc;
 }
 
 // -1 - error, 0 - no caps, 1 partial caps, 2 full caps
@@ -1202,7 +1207,8 @@ if (HAVE_PR_CAP_AMBIENT) {
 // -1 - error, 0 - no caps, 1 partial caps, 2 full caps
 capng_results_t capng_have_permitted_capabilities(void)
 {
-	int empty = 0, full = 0;
+	int empty = 0;
+	int lower_full = 0;
 
 	// First, try to init with current set
 	if (m.state < CAPNG_INIT) {
@@ -1217,16 +1223,14 @@ capng_results_t capng_have_permitted_capabilities(void)
 	if (m.data.v3[0].permitted == 0)
 		empty = 1;
 	else if (m.data.v3[0].permitted == 0xFFFFFFFFU)
-		full = 1;
+		lower_full = 1;
 	else
 		return CAPNG_PARTIAL;
 
 	// At this point, lower 32 bits are either full or empty
-	if ((m.data.v3[1].permitted & UPPER_MASK) == 0 && !full)
+	if ((m.data.v3[1].permitted & UPPER_MASK) == 0 && !lower_full)
 		empty = 1;
-	else if ((m.data.v3[1].permitted & UPPER_MASK) == UPPER_MASK && !empty)
-		full = 1;
-	else
+	else if ((m.data.v3[1].permitted & UPPER_MASK) != UPPER_MASK || empty)
 		return CAPNG_PARTIAL;
 
 	// Partial is already handled, it's either empty or full now
@@ -1461,11 +1465,10 @@ char *capng_print_caps_text(capng_print_t where, capng_type_t which)
 				found = 1;
 			}
 		}
-		if (found) {
-			ptr = malloc(total);
-			if (ptr == NULL)
-				return ptr;
-		}
+		ptr = malloc(found ? total : sizeof("none"));
+		if (ptr == NULL)
+			return ptr;
+		*ptr = 0;
 		found = 0;
 	}
 
@@ -1483,6 +1486,8 @@ char *capng_print_caps_text(capng_print_t where, capng_type_t which)
 				else
 					printf(", %s", n);
 			} else if (where == CAPNG_PRINT_BUFFER) {
+				if (ptr == NULL)
+					return NULL;
 				if (found) {
 					ptr[cnt++] = ',';
 					ptr[cnt++] = ' ';
@@ -1496,8 +1501,10 @@ char *capng_print_caps_text(capng_print_t where, capng_type_t which)
 	if (found == 0) {
 		if (where == CAPNG_PRINT_STDOUT)
 			printf("none");
+		else if (where == CAPNG_PRINT_BUFFER && ptr)
+			strcpy(ptr, "none");
 		else
-			ptr = strdup("none");
+			return NULL;
 	}
 	return ptr;
 }
