@@ -27,8 +27,10 @@
 
 struct netcap_opts {
 	int advanced;
+	int list_interfaces;
 	int json;
 	int no_color;
+	const char *interface;
 };
 
 int netcap_advanced_main(const struct netcap_opts *opts);

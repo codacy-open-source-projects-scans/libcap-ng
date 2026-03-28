@@ -26,14 +26,16 @@
 
 #include "config.h"
 #include <arpa/inet.h>
+#ifdef HAVE_NETCAP_ADVANCED
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
 #include <linux/sock_diag.h>
 #include <linux/vm_sockets.h>
-#include <limits.h>
 #ifdef HAVE_LINUX_VM_SOCKETS_DIAG_H
 #include <linux/vm_sockets_diag.h>
 #endif
+#endif
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
@@ -55,7 +57,9 @@ static char *tacct = NULL;
 
 static void usage(void)
 {
-	fprintf(stderr, "usage: netcap [--advanced [--json] [--no-color]]\n");
+	fprintf(stderr, "usage: netcap [--advanced "
+		"[--interface IFACE] [--list-interfaces] [--json] "
+		"[--no-color]]\n");
 	exit(1);
 }
 
@@ -421,6 +425,7 @@ static void read_packet(void)
 	fclose(f);
 }
 
+#ifdef HAVE_NETCAP_ADVANCED
 static int parse_u32_hex_or_dec(const char *s, unsigned int *out)
 {
 	char *end;
@@ -754,15 +759,33 @@ static void read_vsock(void)
 	if (read_vsock_diag() < 0)
 		read_vsock_proc();
 }
+#endif
 
 int main(int argc, char **argv)
 {
-	struct netcap_opts opts = { 0, 0, 0 };
+	struct netcap_opts opts = { 0, 0, 0, 0, NULL };
 	int i;
 
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--advanced") == 0)
 			opts.advanced = 1;
+		else if (strcmp(argv[i], "--interface") == 0) {
+			if (i + 1 >= argc) {
+				fputs("--interface requires an argument\n",
+					stderr);
+				usage();
+			}
+			opts.interface = argv[++i];
+		} else if (strncmp(argv[i], "--interface=", 12) == 0) {
+			if (argv[i][12] == 0) {
+				fputs("--interface requires an argument\n",
+					stderr);
+				usage();
+			}
+			opts.interface = argv[i] + 12;
+		}
+		else if (strcmp(argv[i], "--list-interfaces") == 0)
+			opts.list_interfaces = 1;
 		else if (strcmp(argv[i], "--json") == 0)
 			opts.json = 1;
 		else if (strcmp(argv[i], "--no-color") == 0)
@@ -777,9 +800,27 @@ int main(int argc, char **argv)
 		fputs("--json is only valid with --advanced\n", stderr);
 		usage();
 	}
+	if (opts.list_interfaces && !opts.advanced) {
+		fputs("--list-interfaces is only valid with --advanced\n",
+			stderr);
+		usage();
+	}
+	if (opts.interface && !opts.advanced) {
+		fputs("--interface is only valid with --advanced\n", stderr);
+		usage();
+	}
 
-	if (opts.advanced)
+	if (opts.advanced) {
+#ifdef HAVE_NETCAP_ADVANCED
 		return netcap_advanced_main(&opts);
+#else
+		fputs("netcap --advanced was disabled at configure time\n",
+			stderr);
+		fputs("because required kernel headers were not available\n",
+			stderr);
+		return 1;
+#endif
+	}
 
 	if (argc > 1) {
 		fputs("Too many arguments\n", stderr);
@@ -807,8 +848,10 @@ int main(int argc, char **argv)
 	read_packet();
 
 	// Add listeners from protocols supported in advanced mode
+#ifdef HAVE_NETCAP_ADVANCED
 	read_diag_listeners();
 	read_vsock();
+#endif
 
 	// Could also do icmp,netlink,unix
 
