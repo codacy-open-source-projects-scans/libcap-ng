@@ -68,7 +68,7 @@ static int get_output_width(void)
 	columns = getenv("COLUMNS");
 	if (columns) {
 		env_width = strtol(columns, NULL, 10);
-		if (env_width >= 40 && env_width <= INT_MAX)
+		if (env_width >= 40 && env_width <= 400)
 			return (int)env_width;
 	}
 
@@ -712,4 +712,7 @@ void analyze_capabilities(void)
 				   "Run as an unprivileged user with no special capabilities.");
 		printf("\n");
 	}
+
+	print_wrapped_text("EXPERIMENTAL NOTICE: ",
+			   "cap-audit output is experimental, but very close.");
 }
