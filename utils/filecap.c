@@ -28,6 +28,7 @@
 #include <string.h>
 #include <errno.h>
 #include "cap-ng.h"
+#include "filecap-path.h"
 #include <fcntl.h>
 #include <ftw.h>
 
@@ -99,6 +100,33 @@ static int check_file(const char *fpath,
 		close(fd);
 	}
 	return ret;
+}
+
+/*
+ * scan_path_env - walk each PATH element while preserving empty entries.
+ *
+ * Empty PATH components mean the current working directory. strtok() drops
+ * them, which makes the default filecap scan disagree with normal PATH
+ * lookup semantics.
+ */
+struct path_scan_ctx {
+	int nftw_flags;
+};
+
+static int scan_path_entry(const char *entry, void *data)
+{
+	struct path_scan_ctx *ctx = data;
+
+	nftw(entry, check_file, 1024, ctx->nftw_flags);
+	return 0;
+}
+
+static int scan_path_env(const char *path_env, int nftw_flags)
+{
+	struct path_scan_ctx ctx;
+
+	ctx.nftw_flags = nftw_flags;
+	return filecap_foreach_path(path_env, scan_path_entry, &ctx);
 }
 
 
@@ -187,14 +215,8 @@ int main(int argc, char *argv[])
 	if (path == NULL && dir == NULL && show_all == 0) {
 		path_env = getenv("PATH");
 		if (path_env != NULL) {
-			path = strdup(path_env);
-			if (!path)
+			if (scan_path_env(path_env, nftw_flags) < 0)
 				return 1;
-			for (dir=strtok(path,":"); dir!=NULL;
-						dir=strtok(NULL,":")) {
-				nftw(dir, check_file, 1024, nftw_flags);
-			}
-			free(path);
 		}
 	} else if (path == NULL && dir == NULL && show_all == 1) {
 		// Find files

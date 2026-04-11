@@ -36,11 +36,18 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include "cap-ng.h"
+#include "proc-account.h"
 #include "proc-sanitize.h"
 
 #define CMD_LEN 16
 #define ACCOUNT_LEN 32
 #define USERNS_MARK_LEN 3	// two characters plus '\0'.
+
+#ifdef PSCAP_TEST
+#define PSCAP_TESTABLE
+#else
+#define PSCAP_TESTABLE static
+#endif
 
 static void usage(void)
 {
@@ -65,7 +72,7 @@ static int get_euid(int pid)
 	snprintf(path, sizeof(path), "/proc/%d/status", pid);
 	f = fopen(path, "rte");
 	if (f == NULL)
-		return 0;
+		return -1;
 
 	__fsetlocking(f, FSETLOCKING_BYCALLER);
 	while (fgets(buf, sizeof(buf), f)) {
@@ -79,31 +86,17 @@ static int get_euid(int pid)
 	fclose(f);
 
 	if (euid < 0)
-		return 0;
+		return -1;
 
 	return euid;
 }
 
 static void get_account_name(int pid, char *account, size_t account_len)
 {
-	struct passwd *p;
 	int euid;
 
 	euid = get_euid(pid);
-	if (euid == 0) {
-		strncpy(account, "root", account_len - 1);
-		account[account_len - 1] = '\0';
-		return;
-	}
-
-	p = getpwuid(euid);
-	if (p && p->pw_name) {
-		strncpy(account, p->pw_name, account_len - 1);
-		account[account_len - 1] = '\0';
-		return;
-	}
-
-	snprintf(account, account_len, "%d", euid);
+	proc_format_account_name_from_euid(euid, account, account_len);
 }
 
 static int get_width(void)
@@ -129,7 +122,7 @@ static int get_width(void)
 	return 80;
 }
 
-static size_t wrap_to(const char *text, size_t max)
+PSCAP_TESTABLE size_t wrap_to(const char *text, size_t max)
 {
 	size_t len = strlen(text);
 	size_t i;
@@ -392,6 +385,7 @@ static bool in_child_userns(int pid)
 	return statbuf.st_ino != own_ns_inode || statbuf.st_dev != own_ns_dev;
 }
 
+#ifndef PSCAP_NO_MAIN
 int main(int argc, char *argv[])
 {
 	char *endptr = NULL;
@@ -571,6 +565,9 @@ int main(int argc, char *argv[])
 				// Take short cut for this one
 				name = "root";
 				uid = 0;
+			} else if (euid < 0) {
+				name = "unknown";
+				uid = -1;
 			} else if (euid != uid) {
 				// Only look up if name changed
 				p = getpwuid(euid);
@@ -624,3 +621,4 @@ int main(int argc, char *argv[])
 	}
 	return 0;
 }
+#endif

@@ -342,33 +342,3 @@ const char *cap_union_reason(const struct cap_check *check)
 		return check->reason;
 	return check->op_reason;
 }
-
-type_t classify_app(const char *exe)
-{
-	int fd;
-	ssize_t rc;
-	char buf[257];
-
-	fd = open(exe, O_RDONLY);
-	if (fd < 0) {
-		fprintf(stderr, "Cannot open %s - %s\n", exe, strerror(errno));
-		exit(1);
-	}
-
-	rc = read(fd, buf, 256);
-	close(fd);
-	if (rc > 0) {
-		buf[rc] = 0;
-		if (buf[0] == '#' && buf[1] == '!') {
-			char *ptr = strchr(buf, '\n');
-
-			if (ptr)
-				*ptr = 0;
-			if (strstr(buf, "python"))
-				return PYTHON;
-		} else if (strncmp(buf, ELFMAGIC, 4) == 0)
-			return ELF;
-	}
-
-	return UNSUPPORTED;
-}

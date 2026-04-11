@@ -47,6 +47,7 @@
 #include <fcntl.h>
 #include <pwd.h>
 #include "cap-ng.h"
+#include "proc-account.h"
 #include "proc-llist.h"
 #include "netcap-advanced.h"
 #include "proc-sanitize.h"
@@ -54,6 +55,12 @@
 static llist l;
 static int perm_warn = 0, header = 0, last_uid = -1;
 static char *tacct = NULL;
+
+#ifdef NETCAP_TEST
+#define NETCAP_TESTABLE
+#else
+#define NETCAP_TESTABLE static
+#endif
 
 static void usage(void)
 {
@@ -142,9 +149,7 @@ static int collect_process_info(void)
 		// Get the effective uid
 		snprintf(buf, sizeof(buf), "/proc/%d/status", pid);
 		sf = fopen(buf, "rte");
-		if (sf == NULL)
-			euid = 0;
-		else {
+		if (sf != NULL) {
 			int line = 0;
 			__fsetlocking(sf, FSETLOCKING_BYCALLER);
 			while (fgets(buf, sizeof(buf), sf)) {
@@ -160,8 +165,6 @@ static int collect_process_info(void)
 				}
 			}
 			fclose(sf);
-			if (euid == -1)
-				euid = 0;
 		}
 
 		caps = capng_have_capabilities(CAPNG_SELECT_AMBIENT);
@@ -273,11 +276,9 @@ static int collect_process_info(void)
 	return 0;
 }
 
-static void report_finding(unsigned int port, const char *type, const char *ifc)
+static void report_finding(const lnode *n, unsigned int port, const char *type,
+			   const char *ifc)
 {
-	struct passwd *p;
-	lnode *n = list_get_cur(&l);
-
 	// And print out anything with capabilities
 	if (header == 0) {
 		printf("%-7s %-7s %-16s %-15s %-8s %-15s %s\n",
@@ -285,18 +286,7 @@ static void report_finding(unsigned int port, const char *type, const char *ifc)
 			"capabilities");
 		header = 1;
 	}
-	if (n->uid == 0) {
-		// Take short cut for this one
-		tacct = "root";
-		last_uid = 0;
-	} else if (last_uid != (int)n->uid) {
-		// Only look up if name changed
-		p = getpwuid(n->uid);
-		last_uid = n->uid;
-		if (p)
-			tacct = p->pw_name;
-		// If not taking this branch, use last val
-	}
+	netcap_update_account_cache(n->uid, &last_uid, (const char **)&tacct);
 	if (tacct) {
 		printf("%-7d %-7d %-16s", n->ppid, n->pid, tacct);
 	} else
@@ -307,6 +297,20 @@ static void report_finding(unsigned int port, const char *type, const char *ifc)
 	else
 		printf(" %-15u", port);
 	printf(" %s %s%s\n", n->capabilities, n->ambient, n->bounds);
+}
+
+/*
+ * Multiple processes can legitimately hold descriptors for the same socket
+ * inode. Report every owner so preforked or reuseport listeners are not
+ * collapsed into a single row.
+ */
+static void report_inode_findings(unsigned long inode, unsigned int port,
+				  const char *type, const char *ifc)
+{
+	lnode *n;
+
+	for (n = list_find_inode(&l, inode); n; n = list_next_inode(&l, inode))
+		report_finding(n, port, type, ifc);
 }
 
 static void read_net(const char *proc, const char *type, int use_local_port)
@@ -339,9 +343,8 @@ static void read_net(const char *proc, const char *type, int use_local_port)
 			&state, &txq, &rxq, &timer_run, &time_len, &retr,
 			&uid, &timeout, &inode, more) < 14)
 			continue;
-		if (list_find_inode(&l, inode))
-			report_finding(use_local_port ? local_port : 0,
-					type, NULL);
+		report_inode_findings(inode, use_local_port ? local_port : 0,
+				      type, NULL);
 	}
 	fclose(f);
 }
@@ -419,14 +422,13 @@ static void read_packet(void)
 			&r, &rmem, &uid, &inode, more) < 9)
 			continue;
 		get_interface(iface, ifc);
-		if (list_find_inode(&l, inode))
-			report_finding(0, "pkt", ifc);
+		report_inode_findings(inode, 0, "pkt", ifc);
 	}
 	fclose(f);
 }
 
 #ifdef HAVE_NETCAP_ADVANCED
-static int parse_u32_hex_or_dec(const char *s, unsigned int *out)
+NETCAP_TESTABLE int parse_u32_hex_or_dec(const char *s, unsigned int *out)
 {
 	char *end;
 	unsigned long v;
@@ -445,6 +447,12 @@ static int parse_u32_hex_or_dec(const char *s, unsigned int *out)
 		base = 16;
 	v = strtoul(s, &end, base);
 	if (end == s || *end)
+		return -1;
+	/*
+	 * /proc and diag inputs are meant to fit in u32 fields. Reject values
+	 * above that range instead of silently truncating them into new ids.
+	 */
+	if (v > UINT_MAX)
 		return -1;
 	*out = (unsigned int)v;
 	return 0;
@@ -509,7 +517,8 @@ static int read_diag_messages(int fd, int proto, const char *type)
 				continue;
 
 			if (proto == IPPROTO_SCTP || proto == IPPROTO_DCCP)
-				report_finding(port, type, NULL);
+				report_inode_findings(r->idiag_inode, port,
+						      type, NULL);
 		}
 	}
 }
@@ -634,7 +643,9 @@ static int read_vsock_diag_messages(int fd)
 			if (r->vdiag_src_port == 0)
 				continue;
 
-			report_finding(r->vdiag_src_port, "vsock", NULL);
+			report_inode_findings(r->vdiag_ino,
+					      r->vdiag_src_port, "vsock",
+					      NULL);
 		}
 	}
 }
@@ -749,7 +760,7 @@ static void read_vsock_proc(void)
 			continue;
 
 		(void)cid;
-		report_finding(port, "vsock", NULL);
+		report_inode_findings(inode, port, "vsock", NULL);
 	}
 	fclose(f);
 }
@@ -761,6 +772,7 @@ static void read_vsock(void)
 }
 #endif
 
+#ifndef NETCAP_NO_MAIN
 int main(int argc, char **argv)
 {
 	struct netcap_opts opts = { 0, 0, 0, 0, NULL };
@@ -858,3 +870,4 @@ int main(int argc, char **argv)
 	list_clear(&l);
 	return 0;
 }
+#endif
