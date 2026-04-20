@@ -50,6 +50,14 @@ AC_PROG_CC
 AC_PROG_INSTALL
 AC_PROG_AWK
 
+AC_MSG_CHECKING([for __atomic_load_n])
+AC_LINK_IFELSE(
+	[AC_LANG_PROGRAM(
+		[[unsigned int test_atomic;]],
+		[[return __atomic_load_n(&test_atomic, __ATOMIC_ACQUIRE);]])],
+	[AC_MSG_RESULT(yes)],
+	[AC_MSG_FAILURE([Compiler support for __atomic_load_n is required by libcap-ng])])
+
 LIBBPF_CFLAGS=""
 LIBBPF_LIBS=""
 LIBAUDIT_CFLAGS=""
@@ -153,8 +161,7 @@ AC_CHECK_HEADERS(sys/xattr.h, [], [
 	])
 AC_CHECK_HEADERS(linux/securebits.h, [], [])
 AC_CHECK_HEADERS(bluetooth/bluetooth.h bluetooth/hci.h, [], [])
-AC_CHECK_HEADERS(linux/inet_diag.h linux/netlink.h linux/sock_diag.h
-	linux/vm_sockets.h, [], [])
+AC_CHECK_HEADERS(linux/inet_diag.h linux/netlink.h linux/sock_diag.h linux/vm_sockets.h, [], [])
 AC_CHECK_HEADERS(linux/vm_sockets_diag.h, [], [])
 AC_CHECK_HEADERS(pthread.h,
 	[AC_SEARCH_LIBS(pthread_atfork, pthread)],
