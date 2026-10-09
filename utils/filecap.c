@@ -1,6 +1,6 @@
 /*
  * filecap.c - A program that lists running processes with capabilities
- * Copyright (c) 2009-10,2012,2017,2020 Red Hat Inc.
+ * Copyright (c) 2009-10,2012,2017-20,2026 Red Hat Inc.
  * All Rights Reserved.
  *
  * This software may be freely redistributed and/or modified under the
@@ -23,6 +23,7 @@
  */
 
 #include "config.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,17 @@
 
 static int show_all = 0, header = 0, capabilities = 0, cremove = 0;
 static int single_file = 0;
+
+static int check_file(const char *fpath, const struct stat *sb,
+		      int typeflag_unused, struct FTW *s_unused)
+	__attr_access ((__read_only__, 1))
+	__attr_access ((__read_only__, 2));
+static int scan_path_entry(const char *entry, void *data)
+	__attr_access ((__read_only__, 1))
+	__attr_access ((__read_write__, 2));
+static int scan_path_env(const char *path_env, int nftw_flags)
+	__attr_access ((__read_only__, 1))
+	__wur;
 
 static void usage(void)
 {
@@ -83,7 +95,7 @@ static int check_file(const char *fpath,
 				       "set", "file");
 			}
 
-			int rootid = capng_get_rootid();
+			uid_t rootid = capng_get_rootid();
 			printf("%s %-22s ",
 			       permitted ? "permitted" : "effective",  fpath);
 
@@ -94,11 +106,12 @@ static int check_file(const char *fpath,
 						CAPNG_PERMITTED);
 
 			if (rootid != CAPNG_UNSET_ROOTID)
-				printf(" %d", rootid);
+				printf(" %ju", (uintmax_t)rootid);
 			printf("\n");
 		}
 		close(fd);
-	}
+	} // Ignore open failure since printing a warning clutters output
+	  // There's a lot of non-root unreadble files in /usr
 	return ret;
 }
 
@@ -238,7 +251,13 @@ int main(int argc, char *argv[])
 				strerror(errno));
 			return 1;
 		}
-		if (have_path_stat && fstat(fd, &fbuf) == 0 &&
+		if ((fstat(fd, &fbuf))) {
+			fprintf(stderr, "Could not fstat %s (%s)\n",
+					path, strerror(errno));
+			close(fd);
+			return 1;
+		}
+		if (have_path_stat &&
 		    (fbuf.st_dev != path_sbuf.st_dev ||
 		     fbuf.st_ino != path_sbuf.st_ino)) {
 			fprintf(stderr,

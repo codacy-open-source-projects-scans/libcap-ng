@@ -1,6 +1,6 @@
 /*
  * netcap.c - A program that lists network apps with capabilities
- * Copyright (c) 2009-10,2012,2020 Red Hat Inc.
+ * Copyright (c) 2009-10,2012,2019-20,2024,2026 Red Hat Inc.
  * All Rights Reserved.
  *
  * This software may be freely redistributed and/or modified under the
@@ -30,9 +30,12 @@
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
 #include <linux/sock_diag.h>
+#ifdef HAVE_NETCAP_VSOCK
+#include <sys/socket.h>
 #include <linux/vm_sockets.h>
 #ifdef HAVE_LINUX_VM_SOCKETS_DIAG_H
 #include <linux/vm_sockets_diag.h>
+#endif
 #endif
 #endif
 #include <limits.h>
@@ -54,7 +57,8 @@
 
 #ifndef NETCAP_NO_MAIN
 static llist l;
-static int perm_warn = 0, header = 0, last_uid = -1;
+static int perm_warn = 0, header = 0;
+static uid_t last_uid = (uid_t)-1;
 static char *tacct = NULL;
 #endif
 
@@ -62,6 +66,17 @@ static char *tacct = NULL;
 #define NETCAP_TESTABLE
 #else
 #define NETCAP_TESTABLE static
+#endif
+
+/*
+ * VSOCK is the production user of this parser. Keep it available to the
+ * direct utility test even when configure disables all advanced support.
+ */
+#if defined(HAVE_NETCAP_VSOCK) || defined(NETCAP_TEST)
+NETCAP_TESTABLE int parse_u32_hex_or_dec(const char *s, unsigned int *out)
+	__attr_access ((__read_only__, 1))
+	__attr_access ((__write_only__, 2))
+	__wur;
 #endif
 
 #ifndef NETCAP_NO_MAIN
@@ -96,7 +111,8 @@ static int collect_process_info(void)
 		char *safe_cmd;
 		char *tmp, cmd[16], state;
 		char *text = NULL, *bounds = NULL, *ambient = NULL;
-		int fd, len, euid = -1;
+		int fd, len;
+		uid_t euid = (uid_t)-1;
 
 		// Skip non-process dir entries
 		if(*ent->d_name<'0' || *ent->d_name>'9')
@@ -167,8 +183,8 @@ static int collect_process_info(void)
 					continue;
 				}
 				if (memcmp(buf, "Uid:", 4) == 0) {
-					int id;
-					if (sscanf(buf, "Uid: %d %d",
+					uid_t id;
+					if (sscanf(buf, "Uid: %u %u",
 						&id, &euid) == 2)
 						break;
 				}
@@ -295,11 +311,12 @@ static void report_finding(const lnode *n, unsigned int port, const char *type,
 			"capabilities");
 		header = 1;
 	}
-	netcap_update_account_cache(n->uid, &last_uid, (const char **)&tacct);
+	proc_update_account_cache(n->uid, &last_uid, (const char **)&tacct);
 	if (tacct) {
 		printf("%-7d %-7d %-16s", n->ppid, n->pid, tacct);
 	} else
-		printf("%-7d %-7d %-16d", n->ppid, n->pid, last_uid);
+		printf("%-7d %-7d %-16u", n->ppid, n->pid,
+		       (unsigned int)last_uid);
 	printf(" %-15s %-8s", n->cmd, type);
 	if (ifc)
 		printf(" %-15s", ifc);
@@ -437,7 +454,7 @@ static void read_packet(void)
 }
 #endif
 
-#ifdef HAVE_NETCAP_ADVANCED
+#if defined(HAVE_NETCAP_VSOCK) || defined(NETCAP_TEST)
 NETCAP_TESTABLE int parse_u32_hex_or_dec(const char *s, unsigned int *out)
 {
 	char *end;
@@ -445,6 +462,9 @@ NETCAP_TESTABLE int parse_u32_hex_or_dec(const char *s, unsigned int *out)
 	int base = 10;
 	const char *p;
 
+	/* strtoul accepts signs, but these kernel fields are unsigned. */
+	if (*s == '+' || *s == '-')
+		return -1;
 	for (p = s; *p; p++) {
 		if ((*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
 			base = 16;
@@ -455,19 +475,22 @@ NETCAP_TESTABLE int parse_u32_hex_or_dec(const char *s, unsigned int *out)
 		base = 16;
 	if (base == 10 && strlen(s) > 3 && s[0] == '0')
 		base = 16;
+	errno = 0;
 	v = strtoul(s, &end, base);
-	if (end == s || *end)
+	if (errno == ERANGE || end == s || *end)
 		return -1;
 	/*
-	 * /proc and diag inputs are meant to fit in u32 fields. Reject values
-	 * above that range instead of silently truncating them into new ids.
+	 * /proc and diag inputs are meant to fit in u32 fields. On platforms
+	 * where unsigned long is wider, reject values that would be truncated.
 	 */
 	if (v > UINT_MAX)
 		return -1;
 	*out = (unsigned int)v;
 	return 0;
 }
+#endif
 
+#ifdef HAVE_NETCAP_ADVANCED
 #ifndef NETCAP_NO_MAIN
 static int read_diag_messages(int fd, int proto, const char *type)
 {
@@ -592,6 +615,7 @@ static void read_diag_listeners(void)
 	(void)sctp_ok;
 }
 
+#ifdef HAVE_NETCAP_VSOCK
 #ifdef HAVE_LINUX_VM_SOCKETS_DIAG_H
 static int read_vsock_diag_messages(int fd)
 {
@@ -783,6 +807,7 @@ static void read_vsock(void)
 }
 #endif
 #endif
+#endif
 
 #ifndef NETCAP_NO_MAIN
 int main(int argc, char **argv)
@@ -874,7 +899,9 @@ int main(int argc, char **argv)
 	// Add listeners from protocols supported in advanced mode
 #ifdef HAVE_NETCAP_ADVANCED
 	read_diag_listeners();
+#ifdef HAVE_NETCAP_VSOCK
 	read_vsock();
+#endif
 #endif
 
 	// Could also do icmp,netlink,unix

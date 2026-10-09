@@ -21,12 +21,12 @@
 #include <string.h>
 #include "proc-account.h"
 
-void proc_format_account_name_from_euid(int euid, char *account,
+void proc_format_account_name_from_euid(uid_t euid, char *account,
 					size_t account_len)
 {
 	struct passwd *p;
 
-	if (euid < 0) {
+	if (euid == (uid_t)-1) {
 		strncpy(account, "unknown", account_len - 1);
 		account[account_len - 1] = '\0';
 		return;
@@ -44,11 +44,19 @@ void proc_format_account_name_from_euid(int euid, char *account,
 		return;
 	}
 
-	snprintf(account, account_len, "%d", euid);
+	snprintf(account, account_len, "%u", (unsigned int)euid);
 }
 
-void netcap_update_account_cache(uid_t uid, int *last_uid,
-				 const char **cached_name)
+/*
+ * proc_update_account_cache - update cached passwd lookup state for @uid.
+ * @uid: effective UID to format.
+ * @last_uid: caller's cached UID value, updated when @uid is looked up.
+ * @cached_name: caller's cached passwd name pointer, updated in place.
+ *
+ * Returns no value. @cached_name is NULL when @uid has no passwd entry.
+ */
+void proc_update_account_cache(uid_t uid, uid_t *last_uid,
+			       const char **cached_name)
 {
 	struct passwd *p;
 
@@ -59,10 +67,10 @@ void netcap_update_account_cache(uid_t uid, int *last_uid,
 	}
 	if (uid == (uid_t)-1) {
 		*cached_name = "unknown";
-		*last_uid = -1;
+		*last_uid = (uid_t)-1;
 		return;
 	}
-	if (*last_uid == (int)uid)
+	if (*last_uid == uid)
 		return;
 
 	/*
